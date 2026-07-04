@@ -96,9 +96,6 @@
           </div>
         </div>
 
-        <div class="go-row" id="go-bar">
-          <button class="btn btn-primary btn-go" id="go" disabled>Download</button>
-        </div>
       </section>
 
       <!-- ----------------------- ACTIVITY VIEW ---------------------- -->
@@ -279,6 +276,13 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <!-- Download action bar — a sibling of the dock (NOT inside a .view, whose
+       fade-up transform would make position:fixed anchor to the content
+       instead of the window). Shown only on the Download tab via switchView. -->
+  <div class="go-row" id="go-bar">
+    <button class="btn btn-primary btn-go" id="go" disabled>Download</button>
   </div>
 
   <!-- ========================= BOTTOM DOCK ========================= -->

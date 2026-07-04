@@ -551,6 +551,10 @@ function wireStaticUi() {
 function switchView(name) {
   $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
+  // The Download bar lives outside the views (so its fixed positioning works);
+  // show it only on the Download tab.
+  const bar = $("#go-bar");
+  if (bar) bar.style.display = name === "download" ? "flex" : "none";
   if (name === "activity") $("#activity-badge").classList.add("hidden");
 }
 
