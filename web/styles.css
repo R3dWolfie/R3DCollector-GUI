@@ -350,7 +350,21 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 900;
 .btn-go { width: 100%; font-size: 16px; padding: 16px;
   font-family: var(--font-display); font-weight: 900; letter-spacing: 0.06em;
   text-transform: uppercase; }
-.go-row { display: flex; gap: 12px; margin-top: 20px; align-items: center; }
+/* Pinned action bar: the Download button stays visible at the bottom of the
+   scroll area no matter the window size, so the primary action is never below
+   the fold. Bleeds to the container edges + backdrop blur, matching the dock. */
+.go-row {
+  display: flex; gap: 12px; align-items: center;
+  position: sticky; bottom: 0; z-index: 10;
+  margin: 20px calc(-1 * var(--gutter)) 0;
+  padding: 14px var(--gutter);
+  border-top: 1px solid var(--divider);
+  background: oklch(0.07 0.01 25 / 0.82);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+}
+[data-theme="light"] .go-row { background: oklch(0.99 0.004 25 / 0.9); }
+.go-row .btn-go { flex: 1; }
 
 /* ------------------------------------------------------------ toggle switch */
 .toggle-row { display: flex; align-items: flex-start; gap: 14px;
