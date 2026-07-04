@@ -1394,6 +1394,95 @@ class CmCliInstaller:
         log_func(f"Installed CM CLI: {exe}")
         return exe
 
+    @classmethod
+    def provision(cls, log_func=print) -> Path:
+        """One-click setup of everything Collection Manager needs.
+
+        Windows: just download the CLI. Linux: install the WineHQ flatpak,
+        drop the .NET 9 runtime into its prefix, and grant it access to the
+        osu! data + CM cache — the same steps as scripts/setup-linux.sh, but
+        driven from the app so there's no terminal to open.
+        """
+        if not sys.platform.startswith("linux"):
+            return cls.install(log_func)
+
+        import json as _json
+        import urllib.request
+        import zipfile
+
+        if not shutil.which("flatpak"):
+            raise RuntimeError(
+                "flatpak isn't installed. Install it with your package "
+                "manager first (Arch: sudo pacman -S flatpak · Debian/Ubuntu: "
+                "sudo apt install flatpak), then click Install again.")
+
+        app_id = "org.winehq.Wine"
+        home = Path.home()
+        prefix = home / ".var/app" / app_id / "data/wine"
+        osu_data = _default_lazer_realm_path().parent
+
+        def run(cmd, timeout=None, check=True):
+            log_func("$ " + " ".join(str(c) for c in cmd))
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            if check and p.returncode != 0:
+                raise RuntimeError(
+                    f"'{' '.join(cmd[:3])} …' failed ({p.returncode}): "
+                    f"{(p.stderr or p.stdout).strip()[:400]}")
+            return p
+
+        remotes = subprocess.run(["flatpak", "remotes"],
+                                 capture_output=True, text=True)
+        if "flathub" not in (remotes.stdout or ""):
+            run(["flatpak", "remote-add", "--if-not-exists", "--user",
+                 "flathub", "https://flathub.org/repo/flathub.flatpakrepo"])
+
+        log_func("Installing the WineHQ flatpak (this can take a few minutes)…")
+        branch = "stable-25.08"
+        ls = subprocess.run(
+            ["flatpak", "remote-ls", "flathub",
+             "--columns=application,branch"], capture_output=True, text=True)
+        stables = sorted(
+            parts[1] for parts in (ln.split() for ln in (ls.stdout or "").splitlines())
+            if len(parts) >= 2 and parts[0] == app_id and parts[1].startswith("stable-"))
+        if stables:
+            branch = stables[-1]
+        log_func(f"  wine branch: {branch}")
+        run(["flatpak", "install", "-y", "--user", "--noninteractive",
+             "flathub", f"{app_id}//{branch}"], timeout=2400)
+
+        log_func("Initialising the wine prefix…")
+        run(["flatpak", "run", app_id, "wineboot", "-u"],
+            timeout=300, check=False)
+
+        log_func("Installing the .NET 9 runtime into the wine prefix…")
+        dotnet_dir = prefix / "drive_c/Program Files/dotnet"
+        dotnet_dir.mkdir(parents=True, exist_ok=True)
+        meta_url = ("https://builds.dotnet.microsoft.com/dotnet/"
+                    "release-metadata/9.0/releases.json")
+        with urllib.request.urlopen(meta_url, timeout=60) as r:
+            rel = _json.load(r)["releases"][0]
+        for section in ("runtime", "windowsdesktop"):
+            url = next((f["url"] for f in rel[section]["files"]
+                        if f.get("rid") == "win-x64"
+                        and f["name"].endswith(".zip")), None)
+            if not url:
+                raise RuntimeError(f".NET {section} win-x64 zip not in metadata")
+            log_func(f"  + {section}: {url.rsplit('/', 1)[-1]}")
+            with urllib.request.urlopen(url, timeout=300) as r:
+                data = r.read()
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                zf.extractall(dotnet_dir)
+
+        log_func("Granting wine access to your osu! data…")
+        run(["flatpak", "override", "--user",
+             f"--filesystem={osu_data}", app_id], check=False)
+
+        log_func("Downloading the Collection Manager CLI…")
+        exe = cls.install(log_func)
+        log_func("✓ Collection Manager is ready.")
+        return exe
+
 
 # ---------------------------------------------------------------------------
 # osu!lazer auto-importer (cross-platform)
@@ -3149,6 +3238,28 @@ class JsApi:
         if self._downloader:
             self._downloader.cancel()
         return True
+
+    def install_collection_manager(self) -> dict:
+        """One-click Collection Manager setup. Runs in the background and
+        streams progress via 'cm_setup' events; returns immediately."""
+        import threading
+        if sys.platform.startswith("linux") and not shutil.which("flatpak"):
+            return {"ok": False, "error":
+                    "flatpak isn't installed. Install it with your package "
+                    "manager (e.g. sudo pacman -S flatpak) then try again."}
+
+        def work():
+            def log(line):
+                self._emit_event("cm_setup", {"line": str(line)})
+            try:
+                CmCliInstaller.provision(log_func=log)
+                self._emit_event("cm_setup", {"done": True, "ok": True})
+            except Exception as e:
+                self._emit_event("cm_setup",
+                                 {"done": True, "ok": False, "error": str(e)})
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "started": True}
 
     def confirm_merge(self, proceed: bool) -> bool:
         if not self._downloader:
