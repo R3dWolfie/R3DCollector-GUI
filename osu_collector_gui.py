@@ -1572,30 +1572,55 @@ class OsuLazerImporter:
         return False
 
     def import_file(self, osz_path: Path) -> bool:
-        """Hand a file to the osu!lazer binary; lazer's IPC will pick it up."""
+        """Hand a single file to osu!lazer (kept for callers that want one)."""
+        return self.import_files([osz_path]) > 0
+
+    def import_files(self, paths: list[Path]) -> int:
+        """Hand many files to osu!lazer in as few launches as possible.
+
+        osu!lazer imports every file passed to one launch as a single batch
+        ("importing 1 of N…"), so this drags-and-drops the whole set at once
+        instead of spawning a process per map — which on a Linux AppImage is
+        a FUSE-mount + engine cold-start each time (and rival instances fight
+        over client.realm). Chunked to stay under the OS command-line length
+        limit (small on Windows). Returns how many files were dispatched.
+        """
         if not self.binary or not self.binary.exists():
-            return False
+            return 0
+        files = [str(p) for p in paths if p]
+        if not files:
+            return 0
+        # Windows caps a command line at ~32k chars; Linux/macOS are far
+        # larger. Keep chunks well under either so long paths never overflow.
+        chunk = 40 if sys.platform == "win32" else 300
+        dispatched = 0
+        for i in range(0, len(files), chunk):
+            batch = files[i:i + chunk]
+            if not self._launch_with_files(batch):
+                break
+            dispatched += len(batch)
+            if i + chunk < len(files):
+                time.sleep(0.5)   # let lazer's single-instance IPC settle
+        return dispatched
+
+    def _launch_with_files(self, files: list[str]) -> bool:
         try:
-            kwargs: dict = dict(
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            kwargs: dict = dict(stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
             if sys.platform == "win32":
-                # DETACHED_PROCESS so the import call doesn't block on the
-                # parent and doesn't pop a console window.
-                kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
-                argv = [str(self.binary), str(osz_path)]
+                # DETACHED_PROCESS so the call doesn't block or pop a console.
+                kwargs["creationflags"] = 0x00000008
+                argv = [str(self.binary), *files]
             else:
                 kwargs["start_new_session"] = True
                 if self.binary.name == "sh.ppy.osu":
                     # Flatpak lazer can't see the download folder from inside
-                    # its sandbox, so a plain path import silently fails.
-                    # flatpak's file-forwarding (@@ … @@) mounts the file into
-                    # the sandbox just for this launch so the import works.
+                    # its sandbox, so plain-path imports silently fail.
+                    # flatpak file-forwarding (@@ … @@) mounts the files in.
                     argv = ["flatpak", "run", "--file-forwarding",
-                            "sh.ppy.osu", "@@", str(osz_path), "@@"]
+                            "sh.ppy.osu", "@@", *files, "@@"]
                 else:
-                    argv = [str(self.binary), str(osz_path)]
+                    argv = [str(self.binary), *files]
             subprocess.Popen(argv, **kwargs)
             return True
         except OSError:
@@ -1680,12 +1705,11 @@ class Downloader:
         # _maybe_import path checks job.auto_import before actually
         # invoking it, so this is purely about knowing the binary.
         self.importer = OsuLazerImporter(binary_override=job.osu_binary)
-        # Import throttling state, guarded by a lock so multiple worker
-        # threads can share it cleanly.
         import threading as _t
-        self._import_lock = _t.Lock()
-        self._last_import_ts = 0.0
-        self._import_executor: ThreadPoolExecutor | None = None
+        # Downloaded files are collected here and handed to osu!lazer in one
+        # batch when the run finishes (see _flush_imports) — lazer treats a
+        # multi-file launch as a single "importing 1 of N" batch.
+        self._imported_paths: list[Path] = []
         self._import_calls_issued = 0
         # Event used to pause the worker before the destructive merge so
         # the user can confirm osu!lazer has finished its async import
@@ -1699,20 +1723,12 @@ class Downloader:
         # up only the new ones — not stale .osdb files left over from
         # previous batches in the same output directory.
         self._generated_osdb_files: list[Path] = []
-        if job.auto_import and self.importer.binary:
-            workers = max(1, min(8, job.import_parallel))
-            self._import_executor = ThreadPoolExecutor(
-                max_workers=workers,
-                thread_name_prefix="osu-import",
-            )
 
     def cancel(self) -> None:
         self._cancelled = True
         # Unblock any thread waiting on the merge confirmation gate so
         # it can notice the cancel and exit cleanly.
         self._continue_merge_event.set()
-        if self._import_executor:
-            self._import_executor.shutdown(wait=False, cancel_futures=True)
 
     def _probe_enabled_for_job(self) -> bool:
         """All gates that must be true for the probe step to run.
@@ -1752,30 +1768,24 @@ class Downloader:
 
     # ---- helpers ----------------------------------------------------------
 
-    def _do_import(self, path: Path) -> None:
-        """Run on an import-pool worker; handles delay throttling."""
+    def _maybe_import(self, path: Path) -> None:
+        """Queue a downloaded file for the end-of-run batch import."""
         if not self.job.auto_import or not self.importer.binary:
             return
-        if self.job.import_delay_ms > 0:
-            with self._import_lock:
-                wait = (self._last_import_ts
-                        + self.job.import_delay_ms / 1000.0
-                        - time.monotonic())
-                if wait > 0:
-                    time.sleep(wait)
-                self._last_import_ts = time.monotonic()
-        self.importer.import_file(path)
+        self._imported_paths.append(path)
 
-    def _maybe_import(self, path: Path) -> None:
-        """Submit an import job to the pool (non-blocking)."""
-        if not self._import_executor:
+    def _flush_imports(self) -> None:
+        """Hand every queued file to osu!lazer at once (chunked). osu!lazer
+        imports a multi-file launch as one batch, so this avoids the
+        per-map process storm the old code caused on Linux."""
+        if not self.job.auto_import or not self.importer.binary:
             return
-        try:
-            self._import_executor.submit(self._do_import, path)
-            self._import_calls_issued += 1
-        except RuntimeError:
-            # Pool may have been shut down on cancel.
-            pass
+        if not self._imported_paths:
+            return
+        n = self.importer.import_files(self._imported_paths)
+        self._import_calls_issued = n
+        if n:
+            self._log(f"[lazer] sent {n} map(s) to osu!lazer for batch import")
 
     def _download_one(self, set_id: int, col_dir: Path) -> tuple[int, Path | None, str | None]:
         try:
@@ -2009,10 +2019,11 @@ class Downloader:
             if ok > 0 or skipped > 0 or self.job.generate_osdb:
                 ok_collections += 1
 
-        # Wait for any in-flight imports to drain so the GUI's "done"
-        # message reflects reality.
-        if self._import_executor:
-            self._import_executor.shutdown(wait=True)
+        # Batch-import everything we downloaded into osu!lazer in one go —
+        # lazer handles a multi-file launch as a single "importing 1 of N"
+        # batch instead of a per-map cold-start storm.
+        if not self._cancelled:
+            self._flush_imports()
 
         # --- merge into lazer collections via CM CLI ---
         if self.job.add_to_lazer_collections and not self._cancelled:
