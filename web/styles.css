@@ -216,6 +216,11 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 900;
 /* ------------------------------------------------------------------ main */
 .main {
   grid-area: main; overflow-y: auto; overflow-x: hidden;
+  /* Grid items default to min-height:auto, which lets this row grow to fit
+     its content instead of scrolling — the content then overflows 100vh and
+     body{overflow:hidden} clips it, making the Download button unreachable
+     on shorter windows. min-height:0 lets the row stay bounded and scroll. */
+  min-height: 0;
   padding-bottom: calc(var(--dock-h) + 24px);
 }
 .container { max-width: 880px; margin: 0 auto; padding: 30px var(--gutter); }
