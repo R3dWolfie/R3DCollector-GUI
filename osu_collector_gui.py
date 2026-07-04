@@ -25,7 +25,8 @@ import sys
 import threading
 import time
 from concurrent.futures import (
-    ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout)
+    ThreadPoolExecutor, as_completed, wait as futures_wait,
+    FIRST_COMPLETED, TimeoutError as FuturesTimeout)
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.8"
+APP_VERSION = "1.5.9"
 APP_AUTHOR = "Red"
 
 
@@ -1416,15 +1417,23 @@ class OsuLazerImporter:
 
         if sys.platform.startswith("linux"):
             # AppImage in common locations
-            for d in [home / "Applications", home / "Downloads", home / "bin"]:
-                candidates.extend(d.glob("osu*.AppImage"))
-            for p in [
+            for d in [home / "Applications", home / "Downloads",
+                      home / "bin", home / ".local/bin"]:
+                candidates.extend(sorted(d.glob("osu*.AppImage")))
+            fixed = [
                 Path("/var/lib/flatpak/exports/bin/sh.ppy.osu"),
                 home / ".local/share/flatpak/exports/bin/sh.ppy.osu",
                 Path("/usr/bin/osu-lazer"),
                 Path("/usr/local/bin/osu-lazer"),
-            ]:
-                if p.exists():
+                Path("/opt/osu-lazer-bin/osu-lazer"),  # AUR osu-lazer-bin
+            ]
+            # Anything named osu-lazer / osu! on PATH (covers custom installs).
+            for name in ("osu-lazer", "osu!"):
+                w = shutil.which(name)
+                if w:
+                    fixed.append(Path(w))
+            for p in fixed:
+                if p.exists() and p not in candidates:
                     candidates.append(p)
         elif sys.platform == "win32":
             base = home / "AppData/Local/osulazer"
@@ -1486,9 +1495,19 @@ class OsuLazerImporter:
                 # DETACHED_PROCESS so the import call doesn't block on the
                 # parent and doesn't pop a console window.
                 kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
+                argv = [str(self.binary), str(osz_path)]
             else:
                 kwargs["start_new_session"] = True
-            subprocess.Popen([str(self.binary), str(osz_path)], **kwargs)
+                if self.binary.name == "sh.ppy.osu":
+                    # Flatpak lazer can't see the download folder from inside
+                    # its sandbox, so a plain path import silently fails.
+                    # flatpak's file-forwarding (@@ … @@) mounts the file into
+                    # the sandbox just for this launch so the import works.
+                    argv = ["flatpak", "run", "--file-forwarding",
+                            "sh.ppy.osu", "@@", str(osz_path), "@@"]
+                else:
+                    argv = [str(self.binary), str(osz_path)]
+            subprocess.Popen(argv, **kwargs)
             return True
         except OSError:
             return False
@@ -1803,27 +1822,37 @@ class Downloader:
                         ex.submit(self._download_one, sid, col_dir): sid
                         for sid in set_ids if sid not in skipped_set_ids
                     }
-                    for fut in as_completed(futures):
-                        if self._cancelled:
-                            break
-                        done += 1
-                        self._beatmap_progress(done, len(set_ids))
-                        sid, path, err = fut.result()
-                        if err:
-                            # Transient — all mirrors errored (rate-limit/5xx)
-                            # within the deadline. Recoverable, so queue it for
-                            # the retry pass. DON'T log a red error per set: on a
-                            # big collection that's a wall of scary red for what
-                            # are really "will retry" hiccups. Summarised below.
-                            failed += 1
-                            failed_ids.append(sid)
-                            continue
-                        if path is None:
-                            absent += 1   # 404 everywhere; summarised below
-                            continue
-                        ok += 1
-                        self._log(f"  [{done}/{len(set_ids)}] {path.name}")
-                        self._maybe_import(path)
+                    # Poll with a short timeout instead of blocking in
+                    # as_completed(): otherwise a Cancel click isn't noticed
+                    # until the next download happens to finish, which during
+                    # a rate-limit stall can be many seconds — the "cancel
+                    # button doesn't work" symptom.
+                    pending = set(futures)
+                    while pending and not self._cancelled:
+                        finished, pending = futures_wait(
+                            pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                        for fut in finished:
+                            if self._cancelled:
+                                break
+                            done += 1
+                            self._beatmap_progress(done, len(set_ids))
+                            sid, path, err = fut.result()
+                            if err:
+                                # Transient — all mirrors errored (rate-limit/
+                                # 5xx) within the deadline. Recoverable, so
+                                # queue it for the retry pass. DON'T log a red
+                                # error per set: on a big collection that's a
+                                # wall of scary red for what are really "will
+                                # retry" hiccups. Summarised below.
+                                failed += 1
+                                failed_ids.append(sid)
+                                continue
+                            if path is None:
+                                absent += 1   # 404 everywhere; summarised below
+                                continue
+                            ok += 1
+                            self._log(f"  [{done}/{len(set_ids)}] {path.name}")
+                            self._maybe_import(path)
                 finally:
                     # On cancel, don't block on in-flight downloads — cancel the
                     # queued futures and return now; each running download sees
@@ -3241,7 +3270,25 @@ def main() -> int:
     except Exception:
         pass
 
-    webview.start()
+    # Linux: prefer the self-contained Qt WebEngine backend. The GTK/WebKit
+    # backend crashes on rolling distros (Arch) when PyInstaller's bundled
+    # glib collides with the system's newer libsecret. Qt bundles its own
+    # engine, so it works regardless of the host's GTK stack. Override with
+    # OCG_GUI=gtk to force the old backend when running from source.
+    gui = os.environ.get("OCG_GUI") or None
+    if gui is None and sys.platform.startswith("linux"):
+        if getattr(sys, "frozen", False):
+            # The bundled Qt engine's sandbox helper isn't SUID in a portable
+            # tarball, so the sandbox can't start. We only ever load our own
+            # local, trusted frontend, so disabling it is safe.
+            os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+        try:
+            import qtpy  # noqa: F401 — probe for the Qt backend
+            gui = "qt"
+        except ImportError:
+            gui = None  # let pywebview auto-select (GTK) when Qt isn't present
+
+    webview.start(gui=gui)
     _shutdown()
     return 0
 
