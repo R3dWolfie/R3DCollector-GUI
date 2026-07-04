@@ -216,6 +216,11 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 900;
 /* ------------------------------------------------------------------ main */
 .main {
   grid-area: main; overflow-y: auto; overflow-x: hidden;
+  /* Grid items default to min-height:auto, which lets this row grow to fit
+     its content instead of scrolling — the content then overflows 100vh and
+     body{overflow:hidden} clips it, making the Download button unreachable
+     on shorter windows. min-height:0 lets the row stay bounded and scroll. */
+  min-height: 0;
   padding-bottom: calc(var(--dock-h) + 24px);
 }
 .container { max-width: 880px; margin: 0 auto; padding: 30px var(--gutter); }
@@ -346,6 +351,25 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 900;
   font-family: var(--font-display); font-weight: 900; letter-spacing: 0.06em;
   text-transform: uppercase; }
 .go-row { display: flex; gap: 12px; margin-top: 20px; align-items: center; }
+.go-row .btn-go { flex: 1; }
+
+/* Download action pinned as a FIXED bar at the window bottom (same technique
+   as the dock, which is reliable across engines). It lives inside
+   #view-download, and display:none on inactive views keeps it off the other
+   tabs. z-index below the dock (25) so the progress dock covers it mid-run,
+   when the button is disabled anyway. */
+#go-bar {
+  position: fixed; left: var(--sidebar-w); right: 0; bottom: 0;
+  z-index: 20; margin: 0;
+  padding: 14px var(--gutter);
+  border-top: 1px solid var(--divider);
+  background: oklch(0.07 0.01 25 / 0.92);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+}
+[data-theme="light"] #go-bar { background: oklch(0.99 0.004 25 / 0.94); }
+/* Clear space so the last card isn't hidden behind the fixed bar. */
+#view-download { padding-bottom: 92px; }
 
 /* ------------------------------------------------------------ toggle switch */
 .toggle-row { display: flex; align-items: flex-start; gap: 14px;

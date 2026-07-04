@@ -25,7 +25,8 @@ import sys
 import threading
 import time
 from concurrent.futures import (
-    ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout)
+    ThreadPoolExecutor, as_completed, wait as futures_wait,
+    FIRST_COMPLETED, TimeoutError as FuturesTimeout)
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.8"
+APP_VERSION = "1.5.9"
 APP_AUTHOR = "Red"
 
 
@@ -1393,6 +1394,95 @@ class CmCliInstaller:
         log_func(f"Installed CM CLI: {exe}")
         return exe
 
+    @classmethod
+    def provision(cls, log_func=print) -> Path:
+        """One-click setup of everything Collection Manager needs.
+
+        Windows: just download the CLI. Linux: install the WineHQ flatpak,
+        drop the .NET 9 runtime into its prefix, and grant it access to the
+        osu! data + CM cache — the same steps as scripts/setup-linux.sh, but
+        driven from the app so there's no terminal to open.
+        """
+        if not sys.platform.startswith("linux"):
+            return cls.install(log_func)
+
+        import json as _json
+        import urllib.request
+        import zipfile
+
+        if not shutil.which("flatpak"):
+            raise RuntimeError(
+                "flatpak isn't installed. Install it with your package "
+                "manager first (Arch: sudo pacman -S flatpak · Debian/Ubuntu: "
+                "sudo apt install flatpak), then click Install again.")
+
+        app_id = "org.winehq.Wine"
+        home = Path.home()
+        prefix = home / ".var/app" / app_id / "data/wine"
+        osu_data = _default_lazer_realm_path().parent
+
+        def run(cmd, timeout=None, check=True):
+            log_func("$ " + " ".join(str(c) for c in cmd))
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            if check and p.returncode != 0:
+                raise RuntimeError(
+                    f"'{' '.join(cmd[:3])} …' failed ({p.returncode}): "
+                    f"{(p.stderr or p.stdout).strip()[:400]}")
+            return p
+
+        remotes = subprocess.run(["flatpak", "remotes"],
+                                 capture_output=True, text=True)
+        if "flathub" not in (remotes.stdout or ""):
+            run(["flatpak", "remote-add", "--if-not-exists", "--user",
+                 "flathub", "https://flathub.org/repo/flathub.flatpakrepo"])
+
+        log_func("Installing the WineHQ flatpak (this can take a few minutes)…")
+        branch = "stable-25.08"
+        ls = subprocess.run(
+            ["flatpak", "remote-ls", "flathub",
+             "--columns=application,branch"], capture_output=True, text=True)
+        stables = sorted(
+            parts[1] for parts in (ln.split() for ln in (ls.stdout or "").splitlines())
+            if len(parts) >= 2 and parts[0] == app_id and parts[1].startswith("stable-"))
+        if stables:
+            branch = stables[-1]
+        log_func(f"  wine branch: {branch}")
+        run(["flatpak", "install", "-y", "--user", "--noninteractive",
+             "flathub", f"{app_id}//{branch}"], timeout=2400)
+
+        log_func("Initialising the wine prefix…")
+        run(["flatpak", "run", app_id, "wineboot", "-u"],
+            timeout=300, check=False)
+
+        log_func("Installing the .NET 9 runtime into the wine prefix…")
+        dotnet_dir = prefix / "drive_c/Program Files/dotnet"
+        dotnet_dir.mkdir(parents=True, exist_ok=True)
+        meta_url = ("https://builds.dotnet.microsoft.com/dotnet/"
+                    "release-metadata/9.0/releases.json")
+        with urllib.request.urlopen(meta_url, timeout=60) as r:
+            rel = _json.load(r)["releases"][0]
+        for section in ("runtime", "windowsdesktop"):
+            url = next((f["url"] for f in rel[section]["files"]
+                        if f.get("rid") == "win-x64"
+                        and f["name"].endswith(".zip")), None)
+            if not url:
+                raise RuntimeError(f".NET {section} win-x64 zip not in metadata")
+            log_func(f"  + {section}: {url.rsplit('/', 1)[-1]}")
+            with urllib.request.urlopen(url, timeout=300) as r:
+                data = r.read()
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                zf.extractall(dotnet_dir)
+
+        log_func("Granting wine access to your osu! data…")
+        run(["flatpak", "override", "--user",
+             f"--filesystem={osu_data}", app_id], check=False)
+
+        log_func("Downloading the Collection Manager CLI…")
+        exe = cls.install(log_func)
+        log_func("✓ Collection Manager is ready.")
+        return exe
+
 
 # ---------------------------------------------------------------------------
 # osu!lazer auto-importer (cross-platform)
@@ -1416,15 +1506,23 @@ class OsuLazerImporter:
 
         if sys.platform.startswith("linux"):
             # AppImage in common locations
-            for d in [home / "Applications", home / "Downloads", home / "bin"]:
-                candidates.extend(d.glob("osu*.AppImage"))
-            for p in [
+            for d in [home / "Applications", home / "Downloads",
+                      home / "bin", home / ".local/bin"]:
+                candidates.extend(sorted(d.glob("osu*.AppImage")))
+            fixed = [
                 Path("/var/lib/flatpak/exports/bin/sh.ppy.osu"),
                 home / ".local/share/flatpak/exports/bin/sh.ppy.osu",
                 Path("/usr/bin/osu-lazer"),
                 Path("/usr/local/bin/osu-lazer"),
-            ]:
-                if p.exists():
+                Path("/opt/osu-lazer-bin/osu-lazer"),  # AUR osu-lazer-bin
+            ]
+            # Anything named osu-lazer / osu! on PATH (covers custom installs).
+            for name in ("osu-lazer", "osu!"):
+                w = shutil.which(name)
+                if w:
+                    fixed.append(Path(w))
+            for p in fixed:
+                if p.exists() and p not in candidates:
                     candidates.append(p)
         elif sys.platform == "win32":
             base = home / "AppData/Local/osulazer"
@@ -1474,21 +1572,56 @@ class OsuLazerImporter:
         return False
 
     def import_file(self, osz_path: Path) -> bool:
-        """Hand a file to the osu!lazer binary; lazer's IPC will pick it up."""
+        """Hand a single file to osu!lazer (kept for callers that want one)."""
+        return self.import_files([osz_path]) > 0
+
+    def import_files(self, paths: list[Path]) -> int:
+        """Hand many files to osu!lazer in as few launches as possible.
+
+        osu!lazer imports every file passed to one launch as a single batch
+        ("importing 1 of N…"), so this drags-and-drops the whole set at once
+        instead of spawning a process per map — which on a Linux AppImage is
+        a FUSE-mount + engine cold-start each time (and rival instances fight
+        over client.realm). Chunked to stay under the OS command-line length
+        limit (small on Windows). Returns how many files were dispatched.
+        """
         if not self.binary or not self.binary.exists():
-            return False
+            return 0
+        files = [str(p) for p in paths if p]
+        if not files:
+            return 0
+        # Windows caps a command line at ~32k chars; Linux/macOS are far
+        # larger. Keep chunks well under either so long paths never overflow.
+        chunk = 40 if sys.platform == "win32" else 300
+        dispatched = 0
+        for i in range(0, len(files), chunk):
+            batch = files[i:i + chunk]
+            if not self._launch_with_files(batch):
+                break
+            dispatched += len(batch)
+            if i + chunk < len(files):
+                time.sleep(0.5)   # let lazer's single-instance IPC settle
+        return dispatched
+
+    def _launch_with_files(self, files: list[str]) -> bool:
         try:
-            kwargs: dict = dict(
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            kwargs: dict = dict(stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
             if sys.platform == "win32":
-                # DETACHED_PROCESS so the import call doesn't block on the
-                # parent and doesn't pop a console window.
-                kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
+                # DETACHED_PROCESS so the call doesn't block or pop a console.
+                kwargs["creationflags"] = 0x00000008
+                argv = [str(self.binary), *files]
             else:
                 kwargs["start_new_session"] = True
-            subprocess.Popen([str(self.binary), str(osz_path)], **kwargs)
+                if self.binary.name == "sh.ppy.osu":
+                    # Flatpak lazer can't see the download folder from inside
+                    # its sandbox, so plain-path imports silently fail.
+                    # flatpak file-forwarding (@@ … @@) mounts the files in.
+                    argv = ["flatpak", "run", "--file-forwarding",
+                            "sh.ppy.osu", "@@", *files, "@@"]
+                else:
+                    argv = [str(self.binary), *files]
+            subprocess.Popen(argv, **kwargs)
             return True
         except OSError:
             return False
@@ -1572,12 +1705,11 @@ class Downloader:
         # _maybe_import path checks job.auto_import before actually
         # invoking it, so this is purely about knowing the binary.
         self.importer = OsuLazerImporter(binary_override=job.osu_binary)
-        # Import throttling state, guarded by a lock so multiple worker
-        # threads can share it cleanly.
         import threading as _t
-        self._import_lock = _t.Lock()
-        self._last_import_ts = 0.0
-        self._import_executor: ThreadPoolExecutor | None = None
+        # Downloaded files are collected here and handed to osu!lazer in one
+        # batch when the run finishes (see _flush_imports) — lazer treats a
+        # multi-file launch as a single "importing 1 of N" batch.
+        self._imported_paths: list[Path] = []
         self._import_calls_issued = 0
         # Event used to pause the worker before the destructive merge so
         # the user can confirm osu!lazer has finished its async import
@@ -1591,20 +1723,12 @@ class Downloader:
         # up only the new ones — not stale .osdb files left over from
         # previous batches in the same output directory.
         self._generated_osdb_files: list[Path] = []
-        if job.auto_import and self.importer.binary:
-            workers = max(1, min(8, job.import_parallel))
-            self._import_executor = ThreadPoolExecutor(
-                max_workers=workers,
-                thread_name_prefix="osu-import",
-            )
 
     def cancel(self) -> None:
         self._cancelled = True
         # Unblock any thread waiting on the merge confirmation gate so
         # it can notice the cancel and exit cleanly.
         self._continue_merge_event.set()
-        if self._import_executor:
-            self._import_executor.shutdown(wait=False, cancel_futures=True)
 
     def _probe_enabled_for_job(self) -> bool:
         """All gates that must be true for the probe step to run.
@@ -1644,30 +1768,24 @@ class Downloader:
 
     # ---- helpers ----------------------------------------------------------
 
-    def _do_import(self, path: Path) -> None:
-        """Run on an import-pool worker; handles delay throttling."""
+    def _maybe_import(self, path: Path) -> None:
+        """Queue a downloaded file for the end-of-run batch import."""
         if not self.job.auto_import or not self.importer.binary:
             return
-        if self.job.import_delay_ms > 0:
-            with self._import_lock:
-                wait = (self._last_import_ts
-                        + self.job.import_delay_ms / 1000.0
-                        - time.monotonic())
-                if wait > 0:
-                    time.sleep(wait)
-                self._last_import_ts = time.monotonic()
-        self.importer.import_file(path)
+        self._imported_paths.append(path)
 
-    def _maybe_import(self, path: Path) -> None:
-        """Submit an import job to the pool (non-blocking)."""
-        if not self._import_executor:
+    def _flush_imports(self) -> None:
+        """Hand every queued file to osu!lazer at once (chunked). osu!lazer
+        imports a multi-file launch as one batch, so this avoids the
+        per-map process storm the old code caused on Linux."""
+        if not self.job.auto_import or not self.importer.binary:
             return
-        try:
-            self._import_executor.submit(self._do_import, path)
-            self._import_calls_issued += 1
-        except RuntimeError:
-            # Pool may have been shut down on cancel.
-            pass
+        if not self._imported_paths:
+            return
+        n = self.importer.import_files(self._imported_paths)
+        self._import_calls_issued = n
+        if n:
+            self._log(f"[lazer] sent {n} map(s) to osu!lazer for batch import")
 
     def _download_one(self, set_id: int, col_dir: Path) -> tuple[int, Path | None, str | None]:
         try:
@@ -1803,27 +1921,37 @@ class Downloader:
                         ex.submit(self._download_one, sid, col_dir): sid
                         for sid in set_ids if sid not in skipped_set_ids
                     }
-                    for fut in as_completed(futures):
-                        if self._cancelled:
-                            break
-                        done += 1
-                        self._beatmap_progress(done, len(set_ids))
-                        sid, path, err = fut.result()
-                        if err:
-                            # Transient — all mirrors errored (rate-limit/5xx)
-                            # within the deadline. Recoverable, so queue it for
-                            # the retry pass. DON'T log a red error per set: on a
-                            # big collection that's a wall of scary red for what
-                            # are really "will retry" hiccups. Summarised below.
-                            failed += 1
-                            failed_ids.append(sid)
-                            continue
-                        if path is None:
-                            absent += 1   # 404 everywhere; summarised below
-                            continue
-                        ok += 1
-                        self._log(f"  [{done}/{len(set_ids)}] {path.name}")
-                        self._maybe_import(path)
+                    # Poll with a short timeout instead of blocking in
+                    # as_completed(): otherwise a Cancel click isn't noticed
+                    # until the next download happens to finish, which during
+                    # a rate-limit stall can be many seconds — the "cancel
+                    # button doesn't work" symptom.
+                    pending = set(futures)
+                    while pending and not self._cancelled:
+                        finished, pending = futures_wait(
+                            pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                        for fut in finished:
+                            if self._cancelled:
+                                break
+                            done += 1
+                            self._beatmap_progress(done, len(set_ids))
+                            sid, path, err = fut.result()
+                            if err:
+                                # Transient — all mirrors errored (rate-limit/
+                                # 5xx) within the deadline. Recoverable, so
+                                # queue it for the retry pass. DON'T log a red
+                                # error per set: on a big collection that's a
+                                # wall of scary red for what are really "will
+                                # retry" hiccups. Summarised below.
+                                failed += 1
+                                failed_ids.append(sid)
+                                continue
+                            if path is None:
+                                absent += 1   # 404 everywhere; summarised below
+                                continue
+                            ok += 1
+                            self._log(f"  [{done}/{len(set_ids)}] {path.name}")
+                            self._maybe_import(path)
                 finally:
                     # On cancel, don't block on in-flight downloads — cancel the
                     # queued futures and return now; each running download sees
@@ -1891,10 +2019,11 @@ class Downloader:
             if ok > 0 or skipped > 0 or self.job.generate_osdb:
                 ok_collections += 1
 
-        # Wait for any in-flight imports to drain so the GUI's "done"
-        # message reflects reality.
-        if self._import_executor:
-            self._import_executor.shutdown(wait=True)
+        # Batch-import everything we downloaded into osu!lazer in one go —
+        # lazer handles a multi-file launch as a single "importing 1 of N"
+        # batch instead of a per-map cold-start storm.
+        if not self._cancelled:
+            self._flush_imports()
 
         # --- merge into lazer collections via CM CLI ---
         if self.job.add_to_lazer_collections and not self._cancelled:
@@ -3121,6 +3250,28 @@ class JsApi:
             self._downloader.cancel()
         return True
 
+    def install_collection_manager(self) -> dict:
+        """One-click Collection Manager setup. Runs in the background and
+        streams progress via 'cm_setup' events; returns immediately."""
+        import threading
+        if sys.platform.startswith("linux") and not shutil.which("flatpak"):
+            return {"ok": False, "error":
+                    "flatpak isn't installed. Install it with your package "
+                    "manager (e.g. sudo pacman -S flatpak) then try again."}
+
+        def work():
+            def log(line):
+                self._emit_event("cm_setup", {"line": str(line)})
+            try:
+                CmCliInstaller.provision(log_func=log)
+                self._emit_event("cm_setup", {"done": True, "ok": True})
+            except Exception as e:
+                self._emit_event("cm_setup",
+                                 {"done": True, "ok": False, "error": str(e)})
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "started": True}
+
     def confirm_merge(self, proceed: bool) -> bool:
         if not self._downloader:
             return False
@@ -3241,7 +3392,25 @@ def main() -> int:
     except Exception:
         pass
 
-    webview.start()
+    # Linux: prefer the self-contained Qt WebEngine backend. The GTK/WebKit
+    # backend crashes on rolling distros (Arch) when PyInstaller's bundled
+    # glib collides with the system's newer libsecret. Qt bundles its own
+    # engine, so it works regardless of the host's GTK stack. Override with
+    # OCG_GUI=gtk to force the old backend when running from source.
+    gui = os.environ.get("OCG_GUI") or None
+    if gui is None and sys.platform.startswith("linux"):
+        if getattr(sys, "frozen", False):
+            # The bundled Qt engine's sandbox helper isn't SUID in a portable
+            # tarball, so the sandbox can't start. We only ever load our own
+            # local, trusted frontend, so disabling it is safe.
+            os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+        try:
+            import qtpy  # noqa: F401 — probe for the Qt backend
+            gui = "qt"
+        except ImportError:
+            gui = None  # let pywebview auto-select (GTK) when Qt isn't present
+
+    webview.start(gui=gui)
     _shutdown()
     return 0
 

@@ -24,7 +24,7 @@ jobs:
           - os: macos-latest
             artifact: osu-collector-gui-macos-dmg
           - os: ubuntu-latest
-            artifact: osu-collector-gui-linux-appimage
+            artifact: osu-collector-gui-linux-tarball
 
     steps:
       - name: Checkout
@@ -36,15 +36,9 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install Linux system deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgirepository1.0-dev libcairo2-dev pkg-config \
-            gir1.2-webkit2-4.1 gir1.2-gtk-3.0 \
-            python3-gi python3-gi-cairo \
-            gobject-introspection libfuse2
+      # The Linux build uses pywebview's self-contained Qt WebEngine backend
+      # (bundles its own browser engine), so no system GTK/WebKit is needed —
+      # that GTK stack is exactly what broke on rolling distros like Arch.
 
       - name: Install Python deps
         run: |
@@ -52,9 +46,9 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Install backend extras (Linux GTK)
+      - name: Install backend extras (Linux Qt WebEngine)
         if: runner.os == 'Linux'
-        run: pip install "pywebview[gtk]"
+        run: pip install qtpy PyQt6 PyQt6-WebEngine
 
       - name: Install backend extras (macOS WebKit)
         if: runner.os == 'macOS'
@@ -124,30 +118,27 @@ jobs:
           done
 
       # =============================== LINUX ===============================
-      - name: Build AppImage (Linux)
+      - name: Build tarball (Linux)
         if: runner.os == 'Linux'
         run: |
+          # --collect-all PyQt6 pulls in QtWebEngineProcess + its resources so
+          # the self-contained web engine works from the extracted tarball.
           pyinstaller --noconfirm --windowed \
             --name osu-collector-gui \
             --add-data "web:web" \
+            --collect-all PyQt6 \
             osu_collector_gui.py
           test -d "dist/osu-collector-gui" || { echo "no onedir build"; exit 1; }
-          mkdir -p AppDir/usr/bin
-          cp -r dist/osu-collector-gui/. AppDir/usr/bin/
-          cp packaging/AppRun AppDir/AppRun
-          chmod +x AppDir/AppRun
-          cp packaging/osu-collector-gui.desktop AppDir/osu-collector-gui.desktop
-          cp packaging/icon-256.png AppDir/osu-collector-gui.png
-          # Also install into the hicolor theme path so desktop-integration tools
-          # (AppImageLauncher, AppImagePool, GNOME/KDE) can extract the icon for
-          # the app-menu entry — the root .DirIcon alone isn't enough for them.
-          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-          cp packaging/icon-256.png AppDir/usr/share/icons/hicolor/256x256/apps/osu-collector-gui.png
-          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
-          chmod +x appimagetool
-          export APPIMAGE_EXTRACT_AND_RUN=1
-          ./appimagetool AppDir dist/osu-collector-gui-x86_64.AppImage
-          test -f "dist/osu-collector-gui-x86_64.AppImage" || { echo "no AppImage"; exit 1; }
+          # A tiny top-level launcher so users double-click / run one file.
+          cat > dist/osu-collector-gui/run.sh <<'SH'
+          #!/usr/bin/env bash
+          cd "$(dirname "$(readlink -f "$0")")" && exec ./osu-collector-gui "$@"
+          SH
+          chmod +x dist/osu-collector-gui/run.sh
+          cp packaging/osu-collector-gui.desktop dist/osu-collector-gui/ 2>/dev/null || true
+          cp packaging/icon-256.png dist/osu-collector-gui/icon.png 2>/dev/null || true
+          tar -C dist -czf dist/osu-collector-gui-linux-x86_64.tar.gz osu-collector-gui
+          test -f "dist/osu-collector-gui-linux-x86_64.tar.gz" || { echo "no tarball"; exit 1; }
 
       # ============================== UPLOAD ===============================
       - name: Upload (Windows)
@@ -173,7 +164,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/osu-collector-gui-x86_64.AppImage
+          path: dist/osu-collector-gui-linux-x86_64.tar.gz
           if-no-files-found: error
           retention-days: 30
 
@@ -185,7 +176,7 @@ jobs:
           files: |
             Output/osu-collector-gui-Setup.exe
             dist/osu-collector-gui.dmg
-            dist/osu-collector-gui-x86_64.AppImage
+            dist/osu-collector-gui-linux-x86_64.tar.gz
           fail_on_unmatched_files: false
           generate_release_notes: true
         env:

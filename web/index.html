@@ -96,9 +96,6 @@
           </div>
         </div>
 
-        <div class="go-row">
-          <button class="btn btn-primary btn-go" id="go" disabled>Download</button>
-        </div>
       </section>
 
       <!-- ----------------------- ACTIVITY VIEW ---------------------- -->
@@ -239,6 +236,10 @@
           </div>
           <label class="field-label" for="cm_cli_command">Collection Manager CLI command</label>
           <input id="cm_cli_command" class="text-input mono" placeholder="(auto-detected)" />
+          <div class="input-row" style="margin-top:10px;align-items:center;">
+            <button class="btn" id="install-cm" type="button">Install Collection Manager</button>
+            <span class="dim mono" id="cm-install-status" style="font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+          </div>
           <label class="field-label" for="custom_mirrors" style="margin-top:14px;">Extra mirrors (one URL template per line, {id})</label>
           <textarea id="custom_mirrors" class="hero-input" style="min-height:64px;font-size:12.5px;"
             placeholder="https://example.com/d/{id}"></textarea>
@@ -275,6 +276,13 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <!-- Download action bar — a sibling of the dock (NOT inside a .view, whose
+       fade-up transform would make position:fixed anchor to the content
+       instead of the window). Shown only on the Download tab via switchView. -->
+  <div class="go-row" id="go-bar">
+    <button class="btn btn-primary btn-go" id="go" disabled>Download</button>
   </div>
 
   <!-- ========================= BOTTOM DOCK ========================= -->

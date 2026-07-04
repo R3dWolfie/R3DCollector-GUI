@@ -291,6 +291,28 @@ async function onGo() {
 }
 
 /* ----------------------------------------------------------- events in */
+function onCmSetup(d) {
+  const status = $("#cm-install-status");
+  const btn = $("#install-cm");
+  if (d.line) {
+    if (status) status.textContent = d.line;
+    appendLog(d.line, "l-dim");
+  }
+  if (d.done) {
+    if (btn) btn.disabled = false;
+    if (d.ok) {
+      if (status) status.textContent = "Installed ✓";
+      toast("Collection Manager is ready", "ok", "// setup");
+      (async () => {
+        try { applyState(await api.get_state()); } catch (e) {}
+      })();
+    } else {
+      if (status) status.textContent = d.error || "Install failed";
+      toast(d.error || "Collection Manager install failed", "bad", "// setup");
+    }
+  }
+}
+
 window.ocOnEvent = function (msg) {
   const ev = msg && msg.event;
   const d = (msg && msg.data) || {};
@@ -302,6 +324,7 @@ window.ocOnEvent = function (msg) {
     case "collection_finished": break;
     case "awaiting_import_confirmation": showMergeModal(d.n); break;
     case "batch_finished": onBatchFinished(d); break;
+    case "cm_setup": onCmSetup(d); break;
     case "error":
       appendLog("ERROR: " + d.message, "l-err");
       toast(d.message, "bad", "// error");
@@ -480,6 +503,20 @@ function wireStaticUi() {
   $("#target").addEventListener("change", onTargetChange);
   $("#go").onclick = onGo;
   $("#dock-cancel").onclick = () => { callApi("cancel"); toast("Cancelling…", "", "// cancel"); };
+  const cmBtn = $("#install-cm");
+  if (cmBtn) cmBtn.onclick = async () => {
+    cmBtn.disabled = true;
+    const st = $("#cm-install-status");
+    if (st) st.textContent = "Starting…";
+    const r = await callApi("install_collection_manager");
+    if (r && r.ok === false) {
+      cmBtn.disabled = false;
+      if (st) st.textContent = r.error || "Couldn't start";
+      toast(r.error || "Couldn't start the install", "bad", "// setup");
+    } else {
+      toast("Installing Collection Manager… watch the Activity log", "", "// setup");
+    }
+  };
   $("#open-folder").onclick = () => callApi("open_folder", $("#output").value);
 
   $("#save-settings").onclick = () => saveSettings();
@@ -514,6 +551,10 @@ function wireStaticUi() {
 function switchView(name) {
   $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
+  // The Download bar lives outside the views (so its fixed positioning works);
+  // show it only on the Download tab.
+  const bar = $("#go-bar");
+  if (bar) bar.style.display = name === "download" ? "flex" : "none";
   if (name === "activity") $("#activity-badge").classList.add("hidden");
 }
 
