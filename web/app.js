@@ -385,6 +385,12 @@ function appendLog(line, cls) {
   span.className = cls || classForLine(line);
   span.textContent = line + "\n";
   box.appendChild(span);
+  // Cap the log DOM. A big collection emits a line per beatmap (tens of
+  // thousands), and an unbounded #log grows the DOM until the QtWebEngine
+  // renderer OOMs — plus every append here reads scrollHeight, forcing an
+  // O(n^2) reflow. Keep only the most recent lines.
+  const MAX_LOG_LINES = 500;
+  while (box.childElementCount > MAX_LOG_LINES) box.removeChild(box.firstChild);
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
