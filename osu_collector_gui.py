@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.9"
+APP_VERSION = "1.5.10"
 APP_AUTHOR = "Red"
 
 
@@ -2670,7 +2670,9 @@ def _pick_release_asset(assets: list, platform: str) -> str:
         return find(("setup.exe", ".exe"))
     if platform == "darwin":
         return find((".dmg",))
-    return find((".appimage",))
+    # Linux ships a .tar.gz now; keep .appimage as a fallback for older
+    # releases so the picker is format-agnostic.
+    return find((".tar.gz", ".tgz", ".appimage"))
 
 
 def _launch_updater(path: Path) -> None:
@@ -2679,12 +2681,77 @@ def _launch_updater(path: Path) -> None:
         os.startfile(str(path))  # type: ignore[attr-defined]  # runs Setup.exe
     elif sys.platform == "darwin":
         subprocess.Popen(["open", str(path)])  # mounts the .dmg
+    elif str(path).endswith((".tar.gz", ".tgz")):
+        # Portable tarball: extract beside the current install, swap it in,
+        # relaunch, and exit (see below). Does not return on success.
+        _apply_linux_tarball_update(path)
     else:
         try:
             os.chmod(path, 0o755)
         except OSError:
             pass
         subprocess.Popen([str(path)], start_new_session=True)  # AppImage
+
+
+def _apply_linux_tarball_update(tar_path: Path) -> None:
+    """Update a portable-tarball install in place, then hand off to the new
+    build. Extracts the new tarball onto the same filesystem as the install,
+    renames the old install aside (safe: the running process keeps its open
+    inodes/mmaps), moves the new one in, relaunches it detached, and exits.
+    Rolls back the rename on failure so a botched update can't brick the app.
+    Only meaningful for a frozen (bundled) build."""
+    import tarfile
+    import tempfile
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError(
+            "Running from source — pull the new version with git instead.")
+    exe = Path(sys.executable).resolve()
+    install_dir = exe.parent            # …/osu-collector-gui/
+    parent = install_dir.parent
+    # Stage on the SAME filesystem as the install so the final move is atomic.
+    staging = Path(tempfile.mkdtemp(prefix=".ocg-upd-", dir=str(parent)))
+    try:
+        with tarfile.open(tar_path, "r:gz") as tf:
+            tf.extractall(staging)
+        new_dir = staging / install_dir.name
+        if not (new_dir / exe.name).exists():
+            raise RuntimeError("update archive has an unexpected layout")
+        backup = parent / f"{install_dir.name}.bak-{int(time.time())}"
+        os.rename(install_dir, backup)      # frees the install path
+        try:
+            os.rename(new_dir, install_dir)
+        except OSError:
+            os.rename(backup, install_dir)  # roll back
+            raise
+        new_exe = install_dir / exe.name
+        try:
+            os.chmod(new_exe, 0o755)
+        except OSError:
+            pass
+        subprocess.Popen([str(new_exe)], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    shutil.rmtree(staging, ignore_errors=True)
+    os._exit(0)   # the freshly-launched instance takes over
+
+
+def _cleanup_update_backups() -> None:
+    """Remove leftover *.bak-* / .ocg-upd-* dirs from a previous tarball
+    update (the old install can't delete itself while running, so the next
+    launch cleans up). Best-effort, Linux frozen builds only."""
+    if not (sys.platform.startswith("linux") and getattr(sys, "frozen", False)):
+        return
+    try:
+        install_dir = Path(sys.executable).resolve().parent
+        parent = install_dir.parent
+        for p in parent.glob(f"{install_dir.name}.bak-*"):
+            shutil.rmtree(p, ignore_errors=True)
+        for p in parent.glob(".ocg-upd-*"):
+            shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
 
 
 class JsApi:
@@ -3348,6 +3415,7 @@ def _install_crash_handler() -> None:
 
 def main() -> int:
     _install_crash_handler()
+    _cleanup_update_backups()   # clear leftovers from a prior tarball update
     try:
         import webview
     except ImportError:
