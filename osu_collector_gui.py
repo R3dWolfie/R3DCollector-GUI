@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.10"
+APP_VERSION = "1.5.11"
 APP_AUTHOR = "Red"
 
 
