@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.12"
+APP_VERSION = "1.5.13"
 APP_AUTHOR = "Red"
 
 
@@ -54,6 +54,28 @@ def _default_lazer_realm_path() -> Path:
         return home / "Library/Application Support/osu/client.realm"
     # Linux + everything else
     return home / ".local/share/osu/client.realm"
+
+
+def _child_env() -> dict:
+    """Environment for launching EXTERNAL programs (osu!lazer, Collection
+    Manager CLI, flatpak) from a frozen build.
+
+    PyInstaller points LD_LIBRARY_PATH at its own bundled libraries; a child
+    GUI app that inherits it loads the WRONG system libraries and crashes on
+    startup — silently, since we send its output to /dev/null. That's why
+    launching osu!lazer to import worked from a clean terminal but not from
+    the app. PyInstaller stashes the original value in <VAR>_ORIG; restore it
+    (or drop the var entirely if there was none)."""
+    env = dict(os.environ)
+    for var in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+        orig = env.pop(var + "_ORIG", None)
+        if orig is not None:
+            env[var] = orig
+        elif getattr(sys, "frozen", False):
+            env.pop(var, None)
+    return env
+
+
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+https://github.com/R3dWolfie/Osu-Collector-GUI)"
 
 OSU_COLLECTOR_API = "https://osucollector.com/api"
@@ -1595,23 +1617,42 @@ class OsuLazerImporter:
         files = [str(p) for p in paths if p]
         if not files:
             return 0
-        # Windows caps a command line at ~32k chars; Linux/macOS are far
-        # larger. Keep chunks well under either so long paths never overflow.
-        chunk = 40 if sys.platform == "win32" else 300
+        # Command-line byte budget: ~30k on Windows, ~1.5 MB on Linux/macOS
+        # (well under ARG_MAX). Every realistic collection fits in ONE launch
+        # — which is the whole point: firing several osu processes at once
+        # makes them cold-start and race to forward, so nothing imports. When
+        # a split IS unavoidable (enormous collection), WAIT for each launch
+        # to exit before the next so they never overlap.
+        budget = 28_000 if sys.platform == "win32" else 1_500_000
         dispatched = 0
-        for i in range(0, len(files), chunk):
-            batch = files[i:i + chunk]
-            if not self._launch_with_files(batch):
+        i = 0
+        while i < len(files):
+            j, size = i, 0
+            while j < len(files) and (j == i or size + len(files[j]) + 1 < budget):
+                size += len(files[j]) + 1
+                j += 1
+            batch = files[i:j]
+            proc = self._launch_with_files(batch)
+            if proc is None:
                 break
             dispatched += len(batch)
-            if i + chunk < len(files):
-                time.sleep(0.5)   # let lazer's single-instance IPC settle
+            i = j
+            if i < len(files):
+                # Another chunk follows — let this launch finish forwarding
+                # (or, if it became the primary instance, cap the wait).
+                try:
+                    proc.wait(timeout=90)
+                except Exception:
+                    pass
         return dispatched
 
-    def _launch_with_files(self, files: list[str]) -> bool:
+    def _launch_with_files(self, files: list[str]):
+        """Launch osu!lazer with these files. Returns the Popen (so the
+        caller can wait for it) or None if it couldn't start."""
         try:
             kwargs: dict = dict(stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
+                                stderr=subprocess.DEVNULL,
+                                env=_child_env())
             if sys.platform == "win32":
                 # DETACHED_PROCESS so the call doesn't block or pop a console.
                 kwargs["creationflags"] = 0x00000008
@@ -1626,10 +1667,9 @@ class OsuLazerImporter:
                             "sh.ppy.osu", "@@", *files, "@@"]
                 else:
                     argv = [str(self.binary), *files]
-            subprocess.Popen(argv, **kwargs)
-            return True
+            return subprocess.Popen(argv, **kwargs)
         except OSError:
-            return False
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -1790,7 +1830,7 @@ class Downloader:
         n = self.importer.import_files(self._imported_paths)
         self._import_calls_issued = n
         if n:
-            self._log(f"[lazer] sent {n} map(s) to osu!lazer for batch import")
+            self._log(f"[lazer] handed {n} map(s) to osu!lazer to import")
 
     def _download_one(self, set_id: int, col_dir: Path) -> tuple[int, Path | None, str | None]:
         try:
@@ -2451,7 +2491,8 @@ class Downloader:
         self.importer.binary = binary
         try:
             kwargs: dict = dict(stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
+                                stderr=subprocess.DEVNULL,
+                                env=_child_env())
             if sys.platform == "win32":
                 kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
             else:
