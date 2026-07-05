@@ -53,14 +53,23 @@ async function init() {
   checkUpdate();
 }
 
-async function checkUpdate() {
+async function checkUpdate(manual) {
+  const status = $("#update-status");
+  if (manual && status) status.textContent = "checking…";
   let r;
-  try { r = await api.check_update(); } catch (e) { return; }
+  try { r = await api.check_update(); }
+  catch (e) { if (manual && status) status.textContent = "check failed"; return; }
   if (r && r.update) {
     state.update = r;
     const p = $("#update-pill");
     p.textContent = "⬆ Update to v" + r.latest;
     p.classList.remove("hidden");
+    if (status) status.textContent = "v" + r.latest + " available";
+  } else if (manual && status) {
+    // Surface why nothing showed instead of the old silent nothing.
+    status.textContent = r && r.error
+      ? "couldn't check: " + r.error
+      : "up to date (v" + ((r && r.latest) || "?") + ")";
   }
 }
 
@@ -493,6 +502,8 @@ function toggleTheme() {
 /* ----------------------------------------------------------- static wiring */
 function wireStaticUi() {
   $("#theme-toggle").onclick = toggleTheme;
+  const cu = $("#check-update");
+  if (cu) cu.onclick = () => checkUpdate(true);
   $("#update-pill").onclick = async () => {
     toast("Downloading update…", "", "// update");
     const r = await callApi("apply_update",

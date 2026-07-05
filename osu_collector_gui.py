@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.13"
+APP_VERSION = "1.5.14"
 APP_AUTHOR = "Red"
 
 
@@ -1380,17 +1380,16 @@ class CmCliInstaller:
     @staticmethod
     def install(log_func=print) -> Path:
         """Download + extract latest CM CLI release. Returns the .exe path."""
-        import urllib.request
         import zipfile
 
         CM_CLI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         log_func(f"Downloading {CM_CLI_RELEASE_URL}...")
 
-        req = urllib.request.Request(
-            CM_CLI_RELEASE_URL, headers={"User-Agent": USER_AGENT}
-        )
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = r.read()
+        # requests (certifi CA bundle) — urllib HTTPS fails in a frozen build.
+        resp = requests.get(CM_CLI_RELEASE_URL, timeout=120, allow_redirects=True,
+                            headers={"User-Agent": USER_AGENT})
+        resp.raise_for_status()
+        data = resp.content
         log_func(f"Downloaded {len(data) // 1024} KiB, extracting...")
 
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -1433,8 +1432,6 @@ class CmCliInstaller:
         if not sys.platform.startswith("linux"):
             return cls.install(log_func)
 
-        import json as _json
-        import urllib.request
         import zipfile
 
         if not shutil.which("flatpak"):
@@ -1487,8 +1484,10 @@ class CmCliInstaller:
         dotnet_dir.mkdir(parents=True, exist_ok=True)
         meta_url = ("https://builds.dotnet.microsoft.com/dotnet/"
                     "release-metadata/9.0/releases.json")
-        with urllib.request.urlopen(meta_url, timeout=60) as r:
-            rel = _json.load(r)["releases"][0]
+        mr = requests.get(meta_url, timeout=60, allow_redirects=True,
+                         headers={"User-Agent": USER_AGENT})
+        mr.raise_for_status()
+        rel = mr.json()["releases"][0]
         for section in ("runtime", "windowsdesktop"):
             url = next((f["url"] for f in rel[section]["files"]
                         if f.get("rid") == "win-x64"
@@ -1496,9 +1495,10 @@ class CmCliInstaller:
             if not url:
                 raise RuntimeError(f".NET {section} win-x64 zip not in metadata")
             log_func(f"  + {section}: {url.rsplit('/', 1)[-1]}")
-            with urllib.request.urlopen(url, timeout=300) as r:
-                data = r.read()
-            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            dr = requests.get(url, timeout=300, allow_redirects=True,
+                             headers={"User-Agent": USER_AGENT})
+            dr.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(dr.content)) as zf:
                 zf.extractall(dotnet_dir)
 
         log_func("Granting wine access to your osu! data…")
@@ -3301,18 +3301,30 @@ class JsApi:
     # ----- updates ---------------------------------------------------------
 
     def check_update(self) -> dict:
-        """Query GitHub Releases; report whether a newer version is published."""
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                GITHUB_LATEST_RELEASE_API,
-                headers={"User-Agent": USER_AGENT,
-                         "Accept": "application/vnd.github+json"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as r:
-                data = json.loads(r.read().decode("utf-8"))
-        except Exception:
-            return {"update": False}
+        """Query GitHub Releases; report whether a newer version is published.
+
+        Uses requests (which bundles a certifi CA store) rather than urllib:
+        urllib relies on the system SSL trust store, which a PyInstaller build
+        can't find, so its HTTPS call fails cert verification and we silently
+        showed no update pill — even though map downloads (via requests) work.
+        Retries once, and surfaces the error instead of swallowing it."""
+        data = None
+        err = ""
+        for attempt in range(2):
+            try:
+                r = requests.get(
+                    GITHUB_LATEST_RELEASE_API, timeout=12, allow_redirects=True,
+                    headers={"User-Agent": USER_AGENT,
+                             "Accept": "application/vnd.github+json"})
+                r.raise_for_status()
+                data = r.json()
+                break
+            except Exception as e:
+                err = str(e)[:200]
+                if attempt == 0:
+                    time.sleep(1.5)
+        if data is None:
+            return {"update": False, "error": err or "couldn't reach GitHub"}
         tag = str(data.get("tag_name") or "")
         if not _is_newer(tag, APP_VERSION):
             return {"update": False, "latest": tag.lstrip("vV")}
@@ -3349,15 +3361,19 @@ class JsApi:
                 pass
             return {"ok": True, "opened": "page"}
         try:
-            import urllib.request
             import tempfile
             name = download_url.split("/")[-1] or "osu-collector-gui-update"
             dest = Path(tempfile.gettempdir()) / name
-            req = urllib.request.Request(
-                download_url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=300) as r, \
-                    open(dest, "wb") as f:
-                shutil.copyfileobj(r, f)
+            # requests (certifi CA bundle) — urllib HTTPS fails in a frozen
+            # build, so the download would 500 the same way the check did.
+            with requests.get(download_url, timeout=600, stream=True,
+                              allow_redirects=True,
+                              headers={"User-Agent": USER_AGENT}) as r:
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            f.write(chunk)
             _launch_updater(dest)
             return {"ok": True, "path": str(dest)}
         except Exception as e:
