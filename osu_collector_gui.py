@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.11"
+APP_VERSION = "1.5.12"
 APP_AUTHOR = "Red"
 
 
@@ -222,7 +222,8 @@ class OsuCollectorClient:
 
     def fetch_collection(self, collection_id: int,
                          with_beatmap_details: bool = False,
-                         progress: Callable[[int], None] | None = None
+                         progress: Callable[[int], None] | None = None,
+                         should_cancel: Callable[[], bool] | None = None
                          ) -> CollectionInfo:
         """Fetch collection metadata + flat list of beatmapset IDs.
 
@@ -258,16 +259,20 @@ class OsuCollectorClient:
         )
 
         if with_beatmap_details:
-            info.beatmaps = self._fetch_beatmaps_paged(collection_id, progress)
+            info.beatmaps = self._fetch_beatmaps_paged(
+                collection_id, progress, should_cancel)
         return info
 
     def _fetch_beatmaps_paged(self, collection_id: int,
-                              progress: Callable[[int], None] | None = None
+                              progress: Callable[[int], None] | None = None,
+                              should_cancel: Callable[[], bool] | None = None
                               ) -> list[BeatmapInfo]:
         """Page through /beatmapsv2 to get details for every beatmap."""
         out: list[BeatmapInfo] = []
         cursor = "0"
         for _ in range(500):  # safety bound — most collections fit in <50 pages
+            if should_cancel and should_cancel():
+                break   # a big collection can be mid-fetch when Cancel is hit
             url = (f"{OSU_COLLECTOR_API}/collections/{collection_id}/beatmapsv2"
                    f"?perPage=100&cursor={cursor}")
             r = self._get(url)
@@ -1833,10 +1838,15 @@ class Downloader:
                     progress=(lambda n: self._prep(
                         f"Fetching beatmap details… {n:,} so far"))
                     if need_details else None,
+                    should_cancel=lambda: self._cancelled,
                 )
             except Exception as e:
                 self._error(f"Collection {cid}: {e}")
                 continue
+
+            if self._cancelled:
+                self._log("[cancelled]")
+                break
 
             self._log(
                 f"\n=== Collection {idx}/{total}: {info.name} "
