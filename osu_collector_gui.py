@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.14"
+APP_VERSION = "1.5.15"
 APP_AUTHOR = "Red"
 
 
@@ -208,6 +208,10 @@ class CollectionInfo:
 _MODE_TO_INT = {"osu": 0, "taiko": 1, "fruits": 2, "catch": 2, "mania": 3}
 
 
+class _Cancelled(Exception):
+    """Raised to abort a collection fetch when the user hits Cancel."""
+
+
 class OsuCollectorClient:
     def __init__(self) -> None:
         self.session = requests.Session()
@@ -217,14 +221,19 @@ class OsuCollectorClient:
     # and intermittently 520-524s under load; plus the usual 429/502/503/504.
     _RETRYABLE = frozenset({429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
 
-    def _get(self, url: str, tries: int = 4) -> requests.Response:
+    def _get(self, url: str, tries: int = 4,
+             should_cancel: Callable[[], bool] | None = None) -> requests.Response:
         """GET with exponential backoff on transient osu!collector / Cloudflare
-        errors so one server hiccup doesn't abort the whole run."""
+        errors so one server hiccup doesn't abort the whole run. Checks
+        should_cancel between attempts and during backoff so Cancel is noticed
+        during the fetch, not only during downloads."""
         delay: float = 1.0
         last: Exception | None = None
         for attempt in range(1, tries + 1):
+            if should_cancel and should_cancel():
+                raise _Cancelled()
             try:
-                r = self.session.get(url, timeout=30)
+                r = self.session.get(url, timeout=(10, 30))
             except (requests.ConnectionError, requests.Timeout) as e:
                 last = e
             else:
@@ -233,7 +242,13 @@ class OsuCollectorClient:
                 last = requests.HTTPError(
                     f"{r.status_code} Server Error for url: {url}", response=r)
             if attempt < tries:
-                time.sleep(delay)
+                # Sleep in short slices so Cancel doesn't wait out the backoff.
+                waited = 0.0
+                while waited < delay:
+                    if should_cancel and should_cancel():
+                        raise _Cancelled()
+                    time.sleep(0.2)
+                    waited += 0.2
                 delay = min(delay * 2, 10.0)
         # Retries exhausted: hand back the last response so the caller's own
         # status handling (404 check / raise_for_status) still applies; only a
@@ -256,7 +271,7 @@ class OsuCollectorClient:
         so the UI can show "fetching…" feedback on large collections.
         """
         url = f"{OSU_COLLECTOR_API}/collections/{collection_id}"
-        r = self._get(url)
+        r = self._get(url, should_cancel=should_cancel)
         if r.status_code == 404:
             raise ValueError(f"Collection {collection_id} not found")
         r.raise_for_status()
@@ -280,7 +295,7 @@ class OsuCollectorClient:
             beatmapset_ids=set_ids,
         )
 
-        if with_beatmap_details:
+        if with_beatmap_details and not (should_cancel and should_cancel()):
             info.beatmaps = self._fetch_beatmaps_paged(
                 collection_id, progress, should_cancel)
         return info
@@ -297,7 +312,7 @@ class OsuCollectorClient:
                 break   # a big collection can be mid-fetch when Cancel is hit
             url = (f"{OSU_COLLECTOR_API}/collections/{collection_id}/beatmapsv2"
                    f"?perPage=100&cursor={cursor}")
-            r = self._get(url)
+            r = self._get(url, should_cancel=should_cancel)
             r.raise_for_status()
             data = r.json()
             for b in data.get("beatmaps", []) or []:
@@ -1880,13 +1895,32 @@ class Downloader:
                     if need_details else None,
                     should_cancel=lambda: self._cancelled,
                 )
+            except _Cancelled:
+                self._log("[cancelled]")
+                break
             except Exception as e:
+                if self._cancelled:
+                    self._log("[cancelled]")
+                    break
                 self._error(f"Collection {cid}: {e}")
                 continue
 
             if self._cancelled:
                 self._log("[cancelled]")
                 break
+
+            # Tell the user *why* skip-already-imported did nothing, instead of
+            # silently reporting "0 skipped": it needs the Collection Manager
+            # CLI to read osu!lazer's library (Settings → Install Collection
+            # Manager; on Linux that's the one-time wine setup).
+            if (self.job.skip_already_imported
+                    and not self._probe_enabled_for_job()):
+                self._log(
+                    "  [skip] 'skip already-imported' is on but Collection "
+                    "Manager CLI isn't set up — can't read your osu!lazer "
+                    "library, so nothing is skipped. Set it up in Settings → "
+                    "Install Collection Manager."
+                )
 
             self._log(
                 f"\n=== Collection {idx}/{total}: {info.name} "
