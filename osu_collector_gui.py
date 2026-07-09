@@ -1355,17 +1355,36 @@ class CmCliRunner:
                 osu_location=None,
             )
 
-        # Auto-downloaded copy in our cache dir, run via wine flatpak
-        # (wine needs filesystem permission for the cache dir — we grant
-        # it once during install).
+        # Auto-downloaded copy in our cache dir. Run it through whichever wine
+        # is actually available:
+        #   1. The WineHQ flatpak, but ONLY if it's really installed (the old
+        #      code returned this whenever `flatpak` existed — even with the
+        #      wine app missing, which just errored "not installed").
+        #   2. Otherwise system wine, which accepts unix paths directly. This
+        #      is what works when someone dropped .NET into ~/.wine by hand.
         cached = CM_CLI_CACHE_DIR / "CollectionManager.App.Cli.exe"
-        if cached.exists() and shutil.which("flatpak"):
-            # Wine flatpak prefers Z: drive paths for unix files.
-            wine_path = "Z:" + str(cached).replace("/", "\\")
-            return CmCliConfig(
-                command=["flatpak", "run", "org.winehq.Wine", wine_path],
-                osu_location=None,
+        if cached.exists():
+            flatpak_wine = (
+                bool(shutil.which("flatpak"))
+                and (Path.home() / ".var/app/org.winehq.Wine").exists()
             )
+            if flatpak_wine:
+                wine_path = "Z:" + str(cached).replace("/", "\\")
+                return CmCliConfig(
+                    command=["flatpak", "run", "org.winehq.Wine", wine_path],
+                    osu_location=None,
+                )
+            if shutil.which("wine"):
+                return CmCliConfig(command=["wine", str(cached)],
+                                   osu_location=None)
+            if shutil.which("flatpak"):
+                # flatpak present but wine app not installed yet (e.g. install
+                # still pending) — offer it anyway as a last resort.
+                wine_path = "Z:" + str(cached).replace("/", "\\")
+                return CmCliConfig(
+                    command=["flatpak", "run", "org.winehq.Wine", wine_path],
+                    osu_location=None,
+                )
 
         # Last-ditch: native build on a system that has one.
         for p in (Path("/usr/local/bin/CollectionManager.App.Cli"),
