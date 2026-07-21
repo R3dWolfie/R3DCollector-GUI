@@ -2,7 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.5.8] — 2026-06-23
+## [Unreleased]
+
+### Fixed
+
+- **Auto-import now works when osu!lazer is already running.** The importer
+  launched `osu! <files>` blindly. When the game was **closed** that launch
+  became the primary instance and imported the whole batch in-process (fine).
+  When the game was **already open**, the same launch was a *secondary*
+  instance that forwarded each file over osu!'s single-lane import IPC channel,
+  which has a hard ~3s/file timeout serviced one message at a time — so any
+  real batch overran it and maps were silently dropped (`IPCTimeoutException`).
+  Now the importer detects a running instance and, when osu! is open, forwards
+  **one file per launch, serially with up to 3 retries** (letting the game
+  drain its queue between files) instead of one doomed batched forward. The
+  fast batched cold-launch is kept for when osu! is closed. Reported on NixOS
+  (Nix `osu-lazer-bin`), but the bug hit any platform with the game open during
+  import.
 
 ### Fixed
 

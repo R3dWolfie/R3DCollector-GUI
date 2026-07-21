@@ -1618,26 +1618,39 @@ class OsuLazerImporter:
         return self.import_files([osz_path]) > 0
 
     def import_files(self, paths: list[Path]) -> int:
-        """Hand many files to osu!lazer in as few launches as possible.
+        """Hand many files to osu!lazer, choosing a strategy by whether the
+        game is already running.
 
-        osu!lazer imports every file passed to one launch as a single batch
-        ("importing 1 of N…"), so this drags-and-drops the whole set at once
-        instead of spawning a process per map — which on a Linux AppImage is
-        a FUSE-mount + engine cold-start each time (and rival instances fight
-        over client.realm). Chunked to stay under the OS command-line length
-        limit (small on Windows). Returns how many files were dispatched.
+        - osu! NOT running: the process we spawn becomes the *primary*
+          instance and imports every file passed to it as one in-process batch
+          ("importing 1 of N…"). Fire a single launch (chunked only to stay
+          under the OS command-line length limit).
+        - osu! ALREADY running: a batched launch is instead a *secondary*
+          instance that forwards each file to the running game over osu!'s
+          import IPC channel, which is single-lane with a hard ~3s/file
+          timeout — so a big batch overruns it and maps are silently dropped.
+          Forward one file per launch, serially with retries, letting the
+          running instance drain its queue between files.
+
+        Returns how many files were dispatched.
         """
         if not self.binary or not self.binary.exists():
             return 0
         files = [str(p) for p in paths if p]
         if not files:
             return 0
-        # Command-line byte budget: ~30k on Windows, ~1.5 MB on Linux/macOS
-        # (well under ARG_MAX). Every realistic collection fits in ONE launch
-        # — which is the whole point: firing several osu processes at once
-        # makes them cold-start and race to forward, so nothing imports. When
-        # a split IS unavoidable (enormous collection), WAIT for each launch
-        # to exit before the next so they never overlap.
+        if self.is_running():
+            return self._forward_serial(files)
+        return self._cold_launch_batched(files)
+
+    def _cold_launch_batched(self, files: list[str]) -> int:
+        """osu! is closed: the launch becomes the primary instance and imports
+        the whole batch in-process. Chunk only to stay under the OS
+        command-line byte budget (~30k on Windows, ~1.5 MB on Linux/macOS,
+        well under ARG_MAX); every realistic collection fits in ONE launch.
+        When a split IS unavoidable (enormous collection), WAIT for each launch
+        to exit before starting the next so they never overlap and race over
+        client.realm."""
         budget = 28_000 if sys.platform == "win32" else 1_500_000
         dispatched = 0
         i = 0
@@ -1653,12 +1666,40 @@ class OsuLazerImporter:
             dispatched += len(batch)
             i = j
             if i < len(files):
-                # Another chunk follows — let this launch finish forwarding
-                # (or, if it became the primary instance, cap the wait).
                 try:
                     proc.wait(timeout=90)
                 except Exception:
                     pass
+        return dispatched
+
+    def _forward_serial(self, files: list[str], attempts: int = 3,
+                        retry_delay_s: float = 1.0) -> int:
+        """osu! is already running: forward one file per launch, serially, with
+        retries. Each launch is a secondary instance that hands its single file
+        to the running game over the import IPC channel; on a busy game that
+        send can exceed osu!'s ~3s timeout and the process exits non-zero, so we
+        retry after a short delay (which also gives the game time to drain its
+        queue). Returns the count confirmed dispatched (exit 0 at least once)."""
+        dispatched = 0
+        for f in files:
+            for _ in range(max(1, attempts)):
+                proc = self._launch_with_files([f])
+                if proc is None:
+                    return dispatched  # binary vanished / can't spawn
+                try:
+                    rc = proc.wait(timeout=30)
+                except Exception:
+                    # Didn't exit in time — assume it forwarded rather than
+                    # spawn a duplicate; kill the straggler and move on.
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    rc = 0
+                if rc == 0:
+                    dispatched += 1
+                    break
+                time.sleep(retry_delay_s)
         return dispatched
 
     def _launch_with_files(self, files: list[str]):
