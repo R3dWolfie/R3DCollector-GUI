@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.15"
+APP_VERSION = "1.5.16"
 APP_AUTHOR = "Red"
 
 
@@ -1355,17 +1355,36 @@ class CmCliRunner:
                 osu_location=None,
             )
 
-        # Auto-downloaded copy in our cache dir, run via wine flatpak
-        # (wine needs filesystem permission for the cache dir — we grant
-        # it once during install).
+        # Auto-downloaded copy in our cache dir. Run it through whichever wine
+        # is actually available:
+        #   1. The WineHQ flatpak, but ONLY if it's really installed (the old
+        #      code returned this whenever `flatpak` existed — even with the
+        #      wine app missing, which just errored "not installed").
+        #   2. Otherwise system wine, which accepts unix paths directly. This
+        #      is what works when someone dropped .NET into ~/.wine by hand.
         cached = CM_CLI_CACHE_DIR / "CollectionManager.App.Cli.exe"
-        if cached.exists() and shutil.which("flatpak"):
-            # Wine flatpak prefers Z: drive paths for unix files.
-            wine_path = "Z:" + str(cached).replace("/", "\\")
-            return CmCliConfig(
-                command=["flatpak", "run", "org.winehq.Wine", wine_path],
-                osu_location=None,
+        if cached.exists():
+            flatpak_wine = (
+                bool(shutil.which("flatpak"))
+                and (Path.home() / ".var/app/org.winehq.Wine").exists()
             )
+            if flatpak_wine:
+                wine_path = "Z:" + str(cached).replace("/", "\\")
+                return CmCliConfig(
+                    command=["flatpak", "run", "org.winehq.Wine", wine_path],
+                    osu_location=None,
+                )
+            if shutil.which("wine"):
+                return CmCliConfig(command=["wine", str(cached)],
+                                   osu_location=None)
+            if shutil.which("flatpak"):
+                # flatpak present but wine app not installed yet (e.g. install
+                # still pending) — offer it anyway as a last resort.
+                wine_path = "Z:" + str(cached).replace("/", "\\")
+                return CmCliConfig(
+                    command=["flatpak", "run", "org.winehq.Wine", wine_path],
+                    osu_location=None,
+                )
 
         # Last-ditch: native build on a system that has one.
         for p in (Path("/usr/local/bin/CollectionManager.App.Cli"),
@@ -1806,11 +1825,15 @@ class Downloader:
         # _maybe_import path checks job.auto_import before actually
         # invoking it, so this is purely about knowing the binary.
         self.importer = OsuLazerImporter(binary_override=job.osu_binary)
+        import queue as _q
         import threading as _t
-        # Downloaded files are collected here and handed to osu!lazer in one
-        # batch when the run finishes (see _flush_imports) — lazer treats a
-        # multi-file launch as a single "importing 1 of N" batch.
-        self._imported_paths: list[Path] = []
+        # Import each map into osu!lazer as it finishes downloading, one at a
+        # time. A single worker pulls from this queue and waits for each
+        # osu!lazer launch to hand off before the next — so imports are
+        # serialized (no cold-start race) and spread over the run (handing
+        # lazer all 1000+ at once overwhelms/crashes it).
+        self._import_queue: "_q.Queue" = _q.Queue()
+        self._import_thread: _t.Thread | None = None
         self._import_calls_issued = 0
         # Event used to pause the worker before the destructive merge so
         # the user can confirm osu!lazer has finished its async import
@@ -1870,23 +1893,55 @@ class Downloader:
     # ---- helpers ----------------------------------------------------------
 
     def _maybe_import(self, path: Path) -> None:
-        """Queue a downloaded file for the end-of-run batch import."""
+        """Queue a downloaded map for import; the worker imports it into
+        osu!lazer as soon as it's free (one at a time)."""
         if not self.job.auto_import or not self.importer.binary:
             return
-        self._imported_paths.append(path)
+        self._ensure_import_worker()
+        self._import_queue.put(path)
+        self._import_calls_issued += 1
+
+    def _ensure_import_worker(self) -> None:
+        if self._import_thread is not None:
+            return
+        import threading as _t
+
+        def worker():
+            while True:
+                path = self._import_queue.get()
+                try:
+                    if path is None:
+                        return            # sentinel: run finished
+                    if self._cancelled:
+                        continue          # drain the queue without importing
+                    proc = self.importer._launch_with_files([str(path)])
+                    if proc is not None:
+                        # Serialize: wait for this launch to hand the file off
+                        # to the running instance before starting the next, so
+                        # cold-starting osu processes never pile up. If lazer
+                        # wasn't running the first launch becomes the primary
+                        # and never exits — cap the wait so we don't hang.
+                        try:
+                            proc.wait(timeout=90)
+                        except Exception:
+                            pass
+                finally:
+                    self._import_queue.task_done()
+
+        self._import_thread = _t.Thread(target=worker, name="osu-import",
+                                        daemon=True)
+        self._import_thread.start()
 
     def _flush_imports(self) -> None:
-        """Hand every queued file to osu!lazer at once (chunked). osu!lazer
-        imports a multi-file launch as one batch, so this avoids the
-        per-map process storm the old code caused on Linux."""
-        if not self.job.auto_import or not self.importer.binary:
+        """Signal the import worker that downloads are done and wait for the
+        queue to drain, so 'done' reflects reality before the merge step."""
+        if self._import_thread is None:
             return
-        if not self._imported_paths:
-            return
-        n = self.importer.import_files(self._imported_paths)
-        self._import_calls_issued = n
-        if n:
-            self._log(f"[lazer] handed {n} map(s) to osu!lazer to import")
+        self._import_queue.put(None)   # sentinel
+        if self._import_calls_issued:
+            self._log(f"[lazer] importing {self._import_calls_issued} map(s) "
+                      "into osu!lazer, one at a time…")
+        self._import_thread.join(timeout=1800)
 
     def _download_one(self, set_id: int, col_dir: Path) -> tuple[int, Path | None, str | None]:
         try:
@@ -2144,11 +2199,9 @@ class Downloader:
             if ok > 0 or skipped > 0 or self.job.generate_osdb:
                 ok_collections += 1
 
-        # Batch-import everything we downloaded into osu!lazer in one go —
-        # lazer handles a multi-file launch as a single "importing 1 of N"
-        # batch instead of a per-map cold-start storm.
-        if not self._cancelled:
-            self._flush_imports()
+        # Wait for the per-map import worker to finish handing everything to
+        # osu!lazer before we report "done" / touch the realm.
+        self._flush_imports()
 
         # --- merge into lazer collections via CM CLI ---
         if self.job.add_to_lazer_collections and not self._cancelled:
