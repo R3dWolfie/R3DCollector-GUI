@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.15"
+APP_VERSION = "1.5.17"
 APP_AUTHOR = "Red"
 
 
@@ -76,7 +76,7 @@ def _child_env() -> dict:
     return env
 
 
-USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+https://github.com/R3dWolfie/Osu-Collector-GUI)"
+USER_AGENT = f"{APP_NAME}/{APP_VERSION} (+https://github.com/R3dWolfie/R3DCollector-GUI)"
 
 OSU_COLLECTOR_API = "https://osucollector.com/api"
 # Mirror download endpoints as URL templates — "{id}" is the beatmapset id.
@@ -173,7 +173,7 @@ CM_CLI_RELEASE_URL = (
 
 # This app's own GitHub repo — used by the built-in update checker, which
 # compares APP_VERSION against the latest published Release.
-GITHUB_REPO = "R3dWolfie/Osu-Collector-GUI"
+GITHUB_REPO = "R3dWolfie/R3DCollector-GUI"
 GITHUB_LATEST_RELEASE_API = (
     f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 )
@@ -1291,8 +1291,11 @@ class CmCliRunner:
     DEBUG_LOG = Path("/tmp/oc-cm-cli-debug.log") if sys.platform != "win32" \
         else Path(os.environ.get("TEMP", ".")) / "oc-cm-cli-debug.log"
 
+    _EXE_NAME = "CollectionManager.App.Cli.exe"
+    _upgrade_tried = False
+
     @classmethod
-    def _run(cls, argv: list[str], input_text: str | None = None) -> None:
+    def _exec(cls, argv: list[str], input_text: str | None = None):
         # Always dump the full invocation + output to a debug log so we
         # can actually see what CM CLI did, even when the GUI's error
         # dialog truncates a multi-thousand-line wine register dump.
@@ -1302,12 +1305,21 @@ class CmCliRunner:
             dlog.write(f"argv: {shlex.join(argv)}\n")
             dlog.flush()
 
-            run_kwargs: dict = {}
+            run_kwargs: dict = {"env": _child_env()}
             if sys.platform == "win32":
                 # CM CLI is a console app; in our --windowed build that would
                 # pop a console window for every invocation. CREATE_NO_WINDOW
                 # keeps it hidden.
                 run_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+            else:
+                # Under wine: drop the fixme/err spam, and disable winedbg so
+                # a CLI exception is just a non-zero exit we can report,
+                # not a desktop "Application Crash" dialog.
+                env = run_kwargs["env"]
+                env.setdefault("WINEDEBUG", "-all")
+                env["WINEDLLOVERRIDES"] = ";".join(filter(None, [
+                    env.get("WINEDLLOVERRIDES"),
+                    "winedbg.exe=d", "winemenubuilder.exe=d"]))
             proc = subprocess.run(
                 argv, capture_output=True, text=True, timeout=600,
                 errors="replace",
@@ -1321,6 +1333,62 @@ class CmCliRunner:
             dlog.write(f"--- stdout ---\n{proc.stdout}\n")
             dlog.write(f"--- stderr ---\n{proc.stderr}\n")
             dlog.flush()
+        return proc
+
+    @staticmethod
+    def _schema_mismatch(proc) -> tuple[str, str] | None:
+        """(expected, got) if CM CLI refused the realm because osu!lazer's
+        database schema is newer than this CLI build understands."""
+        m = re.search(r"Expected schema version: '(\d+)', got: '(\d+)'",
+                      f"{proc.stdout or ''}\n{proc.stderr or ''}")
+        return (m.group(1), m.group(2)) if m else None
+
+    @classmethod
+    def _upgraded_argv(cls, argv: list[str]) -> list[str] | None:
+        """Fetch the latest CM CLI into our cache and return argv pointed at
+        it, or None if this invocation isn't one we can swap (a CLI the user
+        installed/configured elsewhere under wine)."""
+        idx = next((i for i, a in enumerate(argv)
+                    if a.endswith(cls._EXE_NAME)), None)
+        if idx is None or cls._upgrade_tried:
+            return None
+        cached = CM_CLI_CACHE_DIR / cls._EXE_NAME
+        as_wine = "Z:" + str(cached).replace("/", "\\")
+        is_cache_copy = argv[idx] in (str(cached), as_wine)
+        if not is_cache_copy and sys.platform != "win32":
+            return None
+        cls._upgrade_tried = True
+        try:
+            CmCliInstaller.install(log_func=lambda s: None)
+        except Exception:
+            return None
+        out = list(argv)
+        if not is_cache_copy:
+            out[idx] = str(cached)   # Windows: supersede the bundled copy
+            try:
+                (CM_CLI_CACHE_DIR / "prefer-cache").write_text("1")
+            except OSError:
+                pass
+        return out
+
+    @classmethod
+    def _run(cls, argv: list[str], input_text: str | None = None) -> None:
+        proc = cls._exec(argv, input_text)
+        mismatch = cls._schema_mismatch(proc)
+        if mismatch:
+            # osu!lazer updated its database format: the usual fix is simply a
+            # newer Collection Manager CLI, so fetch it and retry once.
+            newer = cls._upgraded_argv(argv)
+            if newer is not None:
+                argv = newer
+                proc = cls._exec(argv, input_text)
+                mismatch = cls._schema_mismatch(proc)
+        if mismatch:
+            raise RuntimeError(
+                "osu!lazer's database is newer than Collection Manager "
+                f"supports (schema {mismatch[1]}, CLI understands "
+                f"{mismatch[0]}). A Collection Manager update is needed — "
+                "see github.com/Piotrekol/CollectionManager/releases.")
 
         if proc.returncode != 0:
             # Trim wine's gigantic register dump out of the user-facing
@@ -1357,12 +1425,23 @@ class CmCliRunner:
             # separate Collection Manager download.
             bundled = (Path(sys.executable).resolve().parent
                        / "cm-cli" / "CollectionManager.App.Cli.exe")
+            cached = CM_CLI_CACHE_DIR / "CollectionManager.App.Cli.exe"
             candidates = [
                 bundled,
                 home / "AppData/Local/Programs/Collection Manager/CollectionManager.App.Cli.exe",
                 Path("C:/Program Files/Collection Manager/CollectionManager.App.Cli.exe"),
-                CM_CLI_CACHE_DIR / "CollectionManager.App.Cli.exe",
+                cached,
             ]
+            # A newer copy we fetched after the bundled one turned out too old
+            # for the user's osu!lazer (see CmCliRunner._upgraded_argv).
+            try:
+                if ((CM_CLI_CACHE_DIR / "prefer-cache").exists()
+                        and cached.exists()
+                        and (not bundled.exists() or cached.stat().st_mtime
+                             > bundled.stat().st_mtime)):
+                    candidates.insert(0, cached)
+            except OSError:
+                pass
             for p in candidates:
                 if p.exists():
                     return CmCliConfig(command=[str(p)], osu_location=None)
@@ -1695,6 +1774,27 @@ class OsuLazerImporter:
             return self._forward_serial(files)
         return self._cold_launch_batched(files)
 
+    def import_streamed(self, path: Path, warmup_s: float = 25.0) -> bool:
+        """Import ONE file as part of a stream of per-download imports.
+
+        osu! running: forward it to the game (serial, with retries). osu!
+        closed: this launch becomes the primary instance and never exits, so
+        instead of waiting on it we give the game `warmup_s` to boot and open
+        its import IPC channel before the caller forwards the next file.
+        Returns True if the file was handed off."""
+        if not self.binary or not self.binary.exists() or not path:
+            return False
+        if self.is_running():
+            return self._forward_serial([str(path)]) == 1
+        proc = self._launch_with_files([str(path)])
+        if proc is None:
+            return False
+        try:
+            proc.wait(timeout=warmup_s)
+        except Exception:
+            pass
+        return True
+
     def _cold_launch_batched(self, files: list[str]) -> int:
         """osu! is closed: the launch becomes the primary instance and imports
         the whole batch in-process. Chunk only to stay under the OS
@@ -1858,12 +1958,18 @@ class Downloader:
         # _maybe_import path checks job.auto_import before actually
         # invoking it, so this is purely about knowing the binary.
         self.importer = OsuLazerImporter(binary_override=job.osu_binary)
+        import queue as _q
         import threading as _t
-        # Downloaded files are collected here and handed to osu!lazer in one
-        # batch when the run finishes (see _flush_imports) — lazer treats a
-        # multi-file launch as a single "importing 1 of N" batch.
-        self._imported_paths: list[Path] = []
+        # Each map is imported into osu!lazer as it finishes downloading, by a
+        # single worker thread pulling from this queue — so imports are
+        # serialized (no cold-start race), spread over the run (handing lazer
+        # 1000+ files in one launch overwhelms it), and each one goes through
+        # OsuLazerImporter.import_streamed (retrying forward when the game is
+        # open, warm-up when this run had to start it).
+        self._import_queue: "_q.Queue" = _q.Queue()
+        self._import_thread: _t.Thread | None = None
         self._import_calls_issued = 0
+        self._import_failed = 0
         # Event used to pause the worker before the destructive merge so
         # the user can confirm osu!lazer has finished its async import
         # queue. Set by confirm_merge_continue() from the GUI thread.
@@ -1922,23 +2028,56 @@ class Downloader:
     # ---- helpers ----------------------------------------------------------
 
     def _maybe_import(self, path: Path) -> None:
-        """Queue a downloaded file for the end-of-run batch import."""
+        """Queue a downloaded map; the worker imports it into osu!lazer as
+        soon as it's free (one at a time)."""
         if not self.job.auto_import or not self.importer.binary:
             return
-        self._imported_paths.append(path)
+        self._ensure_import_worker()
+        self._import_queue.put(path)
+
+    def _ensure_import_worker(self) -> None:
+        if self._import_thread is not None:
+            return
+        import threading as _t
+
+        def worker():
+            while True:
+                path = self._import_queue.get()
+                if path is None:
+                    return                # sentinel: downloads are done
+                if self._cancelled:
+                    continue              # drain without importing
+                try:
+                    if self.importer.import_streamed(path):
+                        self._import_calls_issued += 1
+                    else:
+                        self._import_failed += 1
+                except Exception:
+                    self._import_failed += 1
+
+        self._import_thread = _t.Thread(target=worker, name="osu-import",
+                                        daemon=True)
+        self._import_thread.start()
 
     def _flush_imports(self) -> None:
-        """Hand every queued file to osu!lazer at once (chunked). osu!lazer
-        imports a multi-file launch as one batch, so this avoids the
-        per-map process storm the old code caused on Linux."""
-        if not self.job.auto_import or not self.importer.binary:
+        """Tell the import worker downloads are done and wait for its queue
+        to drain, so 'done' reflects reality before the merge step."""
+        if self._import_thread is None:
             return
-        if not self._imported_paths:
-            return
-        n = self.importer.import_files(self._imported_paths)
-        self._import_calls_issued = n
-        if n:
-            self._log(f"[lazer] handed {n} map(s) to osu!lazer to import")
+        pending = self._import_queue.qsize()
+        self._import_queue.put(None)      # sentinel
+        if pending and not self._cancelled:
+            self._log(f"[lazer] finishing {pending} queued import(s)…")
+        # On cancel the worker only has its in-flight file left to finish.
+        self._import_thread.join(timeout=10 if self._cancelled else 3600)
+        self._import_thread = None
+        if self._import_calls_issued:
+            self._log(f"[lazer] handed {self._import_calls_issued} map(s) "
+                      "to osu!lazer to import")
+        if self._import_failed:
+            self._log(f"[lazer] {self._import_failed} map(s) could not be "
+                      "handed to osu!lazer — drag them in from the output "
+                      "folder, or re-run with the game open")
 
     def _download_one(self, set_id: int, col_dir: Path) -> tuple[int, Path | None, str | None]:
         try:
@@ -2196,11 +2335,9 @@ class Downloader:
             if ok > 0 or skipped > 0 or self.job.generate_osdb:
                 ok_collections += 1
 
-        # Batch-import everything we downloaded into osu!lazer in one go —
-        # lazer handles a multi-file launch as a single "importing 1 of N"
-        # batch instead of a per-map cold-start storm.
-        if not self._cancelled:
-            self._flush_imports()
+        # Wait for the per-map import worker to finish handing everything to
+        # osu!lazer before we report "done" / touch the realm.
+        self._flush_imports()
 
         # --- merge into lazer collections via CM CLI ---
         if self.job.add_to_lazer_collections and not self._cancelled:
@@ -2891,8 +3028,11 @@ def _apply_linux_tarball_update(tar_path: Path) -> None:
     try:
         with tarfile.open(tar_path, "r:gz") as tf:
             tf.extractall(staging)
-        new_dir = staging / install_dir.name
-        if not (new_dir / exe.name).exists():
+        # The archive holds one top-level folder; don't assume it has the
+        # same name as the install (users rename the extracted folder).
+        new_dir = next((d for d in sorted(staging.iterdir())
+                        if (d / exe.name).is_file()), None)
+        if new_dir is None:
             raise RuntimeError("update archive has an unexpected layout")
         backup = parent / f"{install_dir.name}.bak-{int(time.time())}"
         os.rename(install_dir, backup)      # frees the install path
@@ -2906,13 +3046,85 @@ def _apply_linux_tarball_update(tar_path: Path) -> None:
             os.chmod(new_exe, 0o755)
         except OSError:
             pass
-        subprocess.Popen([str(new_exe)], start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _relaunch([str(new_exe)], cwd=install_dir)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
     shutil.rmtree(staging, ignore_errors=True)
+    try:
+        tar_path.unlink()
+    except OSError:
+        pass
     os._exit(0)   # the freshly-launched instance takes over
+
+
+def _relaunch(argv: list[str], cwd: Path) -> None:
+    """Start a fresh, detached instance of the app (the caller then exits).
+
+    Restores the pre-PyInstaller library path and tells the new bootloader to
+    start clean (PYINSTALLER_RESET_ENVIRONMENT) — otherwise it inherits this
+    process's _PYI_* state and treats itself as our worker subprocess."""
+    env = _child_env()
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    kwargs: dict = dict(cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(argv, **kwargs)
+
+
+def _source_root() -> Path | None:
+    """The git checkout this app is running from, or None (frozen build, or
+    a source copy that isn't a git clone)."""
+    if getattr(sys, "frozen", False):
+        return None
+    root = Path(__file__).resolve().parent
+    return root if (root / ".git").exists() and shutil.which("git") else None
+
+
+def _update_source_checkout(root: Path, target: str = "") -> dict:
+    """Update a run-from-source install with git and report what happened.
+
+    Fast-forward only, and only on a clean tree — never rewrites or discards
+    anything local. Reinstalls requirements when they changed. `target` is the
+    release version the UI offered (for the 'not on this branch' message)."""
+    def git(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(root), *args], env=_child_env(),
+                              capture_output=True, text=True, errors="replace",
+                              timeout=timeout, stdin=subprocess.DEVNULL)
+
+    def fail(msg: str) -> dict:
+        return {"ok": False, "error": msg}
+
+    try:
+        if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+            return fail("This checkout has uncommitted changes — commit or "
+                        "stash them, then `git pull`.")
+        before = git("rev-parse", "HEAD").stdout.strip()
+        branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        pull = git("pull", "--ff-only", "--tags", timeout=300)
+        if pull.returncode != 0:
+            tail = (pull.stderr or pull.stdout).strip().splitlines()[-1:] or ["?"]
+            return fail(f"git pull failed on '{branch}': {tail[0][:160]}")
+        after = git("rev-parse", "HEAD").stdout.strip()
+        if after == before:
+            return fail(f"Branch '{branch}' is already at its newest commit"
+                        + (f", but v{target} isn't on it yet" if target else "")
+                        + ".")
+        changed = git("diff", "--name-only", before, after).stdout.split()
+        if "requirements.txt" in changed:
+            pip = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "-r",
+                 str(root / "requirements.txt")],
+                capture_output=True, text=True, errors="replace", timeout=900)
+            if pip.returncode != 0:
+                return fail("Code updated, but installing new requirements "
+                            "failed — run `pip install -r requirements.txt`.")
+    except (OSError, subprocess.SubprocessError) as e:
+        return fail(f"git update failed: {str(e)[:160]}")
+    return {"ok": True, "restart": True, "from": before[:7], "to": after[:7]}
 
 
 def _cleanup_update_backups() -> None:
@@ -2946,6 +3158,8 @@ class JsApi:
         self._downloader: Downloader | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._update_lock = threading.Lock()
+        self._offered_update = ""
 
     def set_window(self, window) -> None:
         self._window = window
@@ -3455,8 +3669,10 @@ class JsApi:
         tag = str(data.get("tag_name") or "")
         if not _is_newer(tag, APP_VERSION):
             return {"update": False, "latest": tag.lstrip("vV")}
+        self._offered_update = tag.lstrip("vV")
         return {
             "update": True,
+            "source": not getattr(sys, "frozen", False),
             "latest": tag.lstrip("vV"),
             "url": data.get("html_url") or GITHUB_RELEASES_PAGE,
             "download_url": _pick_release_asset(data.get("assets") or [],
@@ -3465,46 +3681,87 @@ class JsApi:
         }
 
     def apply_update(self, download_url: str = "") -> dict:
-        """Download the platform installer and launch it; if no direct asset
-        is available, open the releases page in the browser instead."""
-        # Running from source (not a frozen/packaged build): downloading and
-        # launching a release artifact is the wrong update vector — it won't
-        # touch the git checkout, and on Linux it would fetch the AppImage
-        # (which is broken on Arch/rolling distros) and crash. Point the user
-        # at the releases page and tell them to update their source instead.
+        """Install the update the UI offered: git fast-forward for a source
+        checkout, otherwise download the platform installer and launch it. If
+        no direct asset is available, open the releases page instead."""
+        # A second click while a (large) download is in flight used to start
+        # a parallel download onto the same file and corrupt it.
+        if self._thread and self._thread.is_alive():
+            return {"ok": False, "error":
+                    "A download is running — let it finish or cancel it "
+                    "before updating."}
+        if not self._update_lock.acquire(blocking=False):
+            return {"ok": False, "busy": True,
+                    "error": "An update is already in progress."}
+        try:
+            return self._apply_update(download_url)
+        finally:
+            self._update_lock.release()
+
+    def _open_releases_page(self, message: str = "") -> dict:
+        try:
+            import webbrowser
+            webbrowser.open(GITHUB_RELEASES_PAGE)
+        except Exception:
+            pass
+        out = {"ok": True, "opened": "page"}
+        if message:
+            out["message"] = message
+        return out
+
+    def _apply_update(self, download_url: str) -> dict:
         if not getattr(sys, "frozen", False):
-            try:
-                import webbrowser
-                webbrowser.open(GITHUB_RELEASES_PAGE)
-            except Exception:
-                pass
-            return {"ok": True, "opened": "page",
-                    "message": "You're running from source — `git pull` to update."}
+            # Running from source: a release artifact is the wrong vector (it
+            # wouldn't touch this checkout). Update the checkout itself.
+            root = _source_root()
+            if root is None:
+                return self._open_releases_page(
+                    "Running from source without git — download the new "
+                    "version from the releases page.")
+            self._emit_event("update_progress", {"phase": "git"})
+            res = _update_source_checkout(
+                root, self._offered_update)
+            if res.get("ok"):
+                self._emit_event("update_progress", {"phase": "restart"})
+                _relaunch([sys.executable, *sys.argv], cwd=Path.cwd())
+                threading.Timer(0.8, lambda: os._exit(0)).start()
+            return res
         if not download_url:
-            try:
-                import webbrowser
-                webbrowser.open(GITHUB_RELEASES_PAGE)
-            except Exception:
-                pass
-            return {"ok": True, "opened": "page"}
+            return self._open_releases_page()
         try:
             import tempfile
             name = download_url.split("/")[-1] or "osu-collector-gui-update"
             dest = Path(tempfile.gettempdir()) / name
+            part = dest.with_name(dest.name + ".part")
             # requests (certifi CA bundle) — urllib HTTPS fails in a frozen
             # build, so the download would 500 the same way the check did.
-            with requests.get(download_url, timeout=600, stream=True,
+            with requests.get(download_url, timeout=60, stream=True,
                               allow_redirects=True,
                               headers={"User-Agent": USER_AGENT}) as r:
                 r.raise_for_status()
-                with open(dest, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0)
+                done, last = 0, 0.0
+                with open(part, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1 << 20):
-                        if chunk:
-                            f.write(chunk)
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        done += len(chunk)
+                        if time.monotonic() - last > 0.25:
+                            last = time.monotonic()
+                            self._emit_event("update_progress", {
+                                "phase": "download", "done": done, "total": total})
+            if total and done != total:
+                part.unlink(missing_ok=True)
+                return {"ok": False, "error":
+                        f"Download was cut short ({done >> 20} of "
+                        f"{total >> 20} MB) — try again."}
+            os.replace(part, dest)
+            self._emit_event("update_progress", {"phase": "install"})
             _launch_updater(dest)
             return {"ok": True, "path": str(dest)}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": str(e)[:300]}
 
     def cancel(self) -> bool:
         if self._downloader:

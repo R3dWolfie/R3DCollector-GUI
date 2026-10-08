@@ -170,6 +170,7 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 900;
   animation: pulse 1.8s ease-out infinite;
 }
 .update-pill:hover { filter: brightness(1.08); }
+.update-pill:disabled { cursor: progress; opacity: .85; filter: none; }
 
 .icon-btn {
   appearance: none; border: 1px solid var(--divider); background: var(--card);

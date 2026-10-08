@@ -93,3 +93,50 @@ def test_hung_forward_is_killed_not_duplicated(tmp_path, monkeypatch):
     n = imp.import_files(_osz(tmp_path, 1))
     assert n == 1                  # treated as forwarded
     assert proc.killed is True     # straggler killed, no duplicate spawned
+
+
+# ---- per-download streamed import -----------------------------------------
+
+def test_streamed_forwards_with_retries_when_running(tmp_path, monkeypatch):
+    imp = _importer(tmp_path)
+    monkeypatch.setattr(imp, "is_running", lambda: True)
+    monkeypatch.setattr(g.time, "sleep", lambda s: None)
+    rcs = iter([1, 0])
+    calls = []
+    monkeypatch.setattr(imp, "_launch_with_files",
+                        lambda batch: calls.append(list(batch)) or _FakeProc(next(rcs)))
+    [f] = _osz(tmp_path, 1)
+    assert imp.import_streamed(f) is True
+    assert calls == [[str(f)], [str(f)]]      # failed once, retried
+
+
+def test_streamed_cold_launch_warms_up_instead_of_waiting_forever(tmp_path, monkeypatch):
+    imp = _importer(tmp_path)
+    monkeypatch.setattr(imp, "is_running", lambda: False)
+    waits = []
+
+    class _Primary(_FakeProc):
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            raise g.subprocess.TimeoutExpired("osu!", timeout)
+
+    monkeypatch.setattr(imp, "_launch_with_files", lambda batch: _Primary())
+    [f] = _osz(tmp_path, 1)
+    assert imp.import_streamed(f, warmup_s=7) is True
+    assert waits == [7]
+
+
+def test_downloader_imports_each_map_as_it_arrives(tmp_path, monkeypatch):
+    job = g.DownloadJob(collection_ids=[1], output_dir=tmp_path, auto_import=True,
+                        osu_binary=str(_importer(tmp_path).binary))
+    d = g.Downloader(job, emit=lambda *a, **k: None)
+    seen = []
+    monkeypatch.setattr(d.importer, "import_streamed",
+                        lambda p: seen.append(p) or p.name != "1.osz")
+    files = _osz(tmp_path, 3)
+    for f in files:
+        d._maybe_import(f)
+    d._flush_imports()
+    assert seen == files                       # one at a time, in order
+    assert d._import_calls_issued == 2 and d._import_failed == 1
+    d._flush_imports()                         # idempotent once drained

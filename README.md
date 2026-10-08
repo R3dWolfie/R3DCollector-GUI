@@ -1,10 +1,10 @@
 # Osu-Collector-GUI
 
-[![Build Windows .exe](https://github.com/R3dWolfie/Osu-Collector-GUI/actions/workflows/build-windows.yml/badge.svg)](https://github.com/R3dWolfie/Osu-Collector-GUI/actions/workflows/build-windows.yml)
+[![Build Windows .exe](https://github.com/R3dWolfie/R3DCollector-GUI/actions/workflows/build-windows.yml/badge.svg)](https://github.com/R3dWolfie/R3DCollector-GUI/actions/workflows/build-windows.yml)
 
 A cross-platform GUI for downloading [osu!collector](https://osucollector.com/) collections, with live progress and optional auto-import to **osu!lazer**. Built in the **R3D "Cherry"** design system — a warm near-black look with industrial-condensed display type and monospace technical labelling.
 
-> **Windows users**: pre-built `.exe` is on every [GitHub Actions](https://github.com/R3dWolfie/Osu-Collector-GUI/actions) run as a build artifact, and tagged releases get a published binary on the [Releases](https://github.com/R3dWolfie/Osu-Collector-GUI/releases) page.
+> **Windows users**: pre-built `.exe` is on every [GitHub Actions](https://github.com/R3dWolfie/R3DCollector-GUI/actions) run as a build artifact, and tagged releases get a published binary on the [Releases](https://github.com/R3dWolfie/R3DCollector-GUI/releases) page.
 
 The interface is an HTML/CSS/JS frontend rendered in a native [pywebview](https://pywebview.flowlib.org/) window, sitting on top of a pure-Python download engine. It talks to osu!collector's HTTP API directly and downloads `.osz` files from public osu! mirrors. Runs on **Linux**, **Windows**, and **macOS**.
 
@@ -32,7 +32,7 @@ Everything else — your osu!lazer binary, `client.realm`, the Collection Manage
 
 Most people want the prebuilt release — no Python, no terminal.
 
-**→ Grab the latest from the [Releases page](https://github.com/R3dWolfie/Osu-Collector-GUI/releases/latest).**
+**→ Grab the latest from the [Releases page](https://github.com/R3dWolfie/R3DCollector-GUI/releases/latest).**
 
 | Platform | Download | Setup |
 |---|---|---|
@@ -53,8 +53,8 @@ So: downloading collections into your lazer library *just works* anywhere. Organ
 ## Run from source (any OS)
 
 ```sh
-git clone https://github.com/R3dWolfie/Osu-Collector-GUI.git
-cd Osu-Collector-GUI
+git clone https://github.com/R3dWolfie/R3DCollector-GUI.git
+cd R3DCollector-GUI
 python3 -m venv .venv
 source .venv/bin/activate         # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
