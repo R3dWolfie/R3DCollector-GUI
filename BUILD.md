@@ -54,8 +54,8 @@ Each binary must be built **on its own OS** (PyInstaller does not
 cross-compile). Common first steps:
 
 ```sh
-git clone https://github.com/R3dWolfie/Osu-Collector-GUI.git
-cd Osu-Collector-GUI
+git clone https://github.com/R3dWolfie/R3DCollector-GUI.git
+cd R3DCollector-GUI
 python3 -m venv .venv
 # activate it (see per-OS lines below), then:
 pip install -r requirements.txt

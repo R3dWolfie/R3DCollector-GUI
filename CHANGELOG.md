@@ -2,10 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.5.17] — 2026-10-08
 
 ### Fixed
 
+- **Collections work again on current osu!lazer.** A lazer update bumped its
+  database schema (51 → 52); the Collection Manager CLI the app had cached or
+  bundled (1.2.2) rejected it with an unhandled exception — on Linux that
+  surfaced as a wine "Application Crash" dialog, everywhere it killed the
+  collection list, merge, export and skip-already-imported. The app now
+  notices the schema mismatch, **fetches the latest Collection Manager CLI
+  itself and retries**, and if even the newest CLI is too old it says so in
+  plain words instead of crashing. wine's crash dialog and debug spam are
+  suppressed for CLI runs.
+- **Skip-already-imported works with Collection Manager CLI 1.3.0.** 1.3.0
+  renamed `create -b` to `-i` and stopped reading id/hash lists from a file,
+  so the probe silently matched nothing and every run re-downloaded
+  everything. Ids and hashes now go through the CLI's `interactive` mode on
+  stdin (one launch, lazer's database loaded once), with the old calls kept
+  as a fallback for older CLIs.
+- **The update button actually updates.**
+  - Run-from-source installs (the recommended Linux setup) used to just open
+    the releases page. They now `git pull --ff-only`, reinstall requirements
+    if they changed, and restart — refusing, with a clear message, to touch a
+    checkout that has local changes or has diverged.
+  - Packaged builds show download progress on the button (the Linux build is
+    ~250 MB and looked frozen), ignore repeat clicks (a second click started a
+    parallel download onto the same file and corrupted it), verify the
+    download completed, and the Linux build no longer fails when the install
+    folder was renamed.
+  - The update check now points at the repo's current name instead of relying
+    on GitHub's rename redirect.
+- **Auto-import: per-download again, with retries.** v1.5.16 (imports each map
+  as it downloads, one at a time, so lazer is never handed 1000+ files at
+  once) and the fix below (retrying forward when osu! is already open) were on
+  separate branches; they are now combined. When this run has to start osu!
+  itself it waits for the game to boot before forwarding the next map.
+- Collection Manager CLI falls back to system `wine` when the WineHQ flatpak
+  isn't installed (from v1.5.16).
 - **Auto-import now works when osu!lazer is already running.** The importer
   launched `osu! <files>` blindly. When the game was **closed** that launch
   became the primary instance and imported the whole batch in-process (fine).

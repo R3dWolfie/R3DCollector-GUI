@@ -73,6 +73,19 @@ async function checkUpdate(manual) {
   }
 }
 
+function onUpdateProgress(d) {
+  const pill = $("#update-pill");
+  if (!pill) return;
+  if (d.phase === "download") {
+    const mb = (n) => Math.round(n / 1048576);
+    pill.textContent = d.total
+      ? "Downloading " + Math.floor((d.done / d.total) * 100) + "% (" + mb(d.done) + "/" + mb(d.total) + " MB)"
+      : "Downloading " + mb(d.done) + " MB";
+  } else if (d.phase === "git") pill.textContent = "Pulling update…";
+  else if (d.phase === "install") pill.textContent = "Installing…";
+  else if (d.phase === "restart") pill.textContent = "Restarting…";
+}
+
 /* --------------------------------------------------------- apply state */
 function applyState(st) {
   state.labels = st.labels || state.labels;
@@ -334,6 +347,7 @@ window.ocOnEvent = function (msg) {
     case "awaiting_import_confirmation": showMergeModal(d.n); break;
     case "batch_finished": onBatchFinished(d); break;
     case "cm_setup": onCmSetup(d); break;
+    case "update_progress": onUpdateProgress(d); break;
     case "error":
       appendLog("ERROR: " + d.message, "l-err");
       toast(d.message, "bad", "// error");
@@ -505,14 +519,24 @@ function wireStaticUi() {
   const cu = $("#check-update");
   if (cu) cu.onclick = () => checkUpdate(true);
   $("#update-pill").onclick = async () => {
-    toast("Downloading update…", "", "// update");
+    const pill = $("#update-pill");
+    if (pill.disabled) return;
+    const label = pill.textContent;
+    pill.disabled = true;
+    pill.textContent = "Updating…";
     const r = await callApi("apply_update",
       (state.update && state.update.download_url) || "");
+    if (r && r.ok && r.restart) {
+      pill.textContent = "Restarting…";
+      return;                       // the new instance replaces this window
+    }
+    pill.disabled = false;
+    pill.textContent = label;
     if (r && r.ok && r.opened === "page")
       toast(r.message || "Opened the releases page in your browser.", "ok", "// update");
     else if (r && r.ok)
       toast("Installer launched — close this app to finish updating.", "ok", "// update");
-    else
+    else if (!(r && r.busy))
       toast((r && r.error) || "Update failed.", "bad", "// update");
   };
   $$(".nav-item").forEach((b) => (b.onclick = () => switchView(b.dataset.view)));
