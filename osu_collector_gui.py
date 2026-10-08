@@ -1224,6 +1224,9 @@ class CmCliRunner:
                            flag, str(query_file),
                            "-o", str(probe_osdb),
                            "-l", str(probe_realm_dir)])
+                _collect()
+
+            def _collect() -> None:
                 if not probe_osdb.exists() or probe_osdb.stat().st_size == 0:
                     return
                 for c in OsdbReader.read(probe_osdb):
@@ -1238,10 +1241,38 @@ class CmCliRunner:
                         if getattr(bm, "md5", ""):
                             resolved_hashes.add(bm.md5)
 
-            if hashes:
-                _run_query("-h", hashes)
-            if beatmap_ids:
-                _run_query("-b", beatmap_ids)
+            # CM CLI 1.3.0+ renamed -b to -i and no longer reads -h/-i values
+            # from a file (the path itself gets treated as one hash), so feed
+            # the values through its `interactive` REPL on stdin instead: no
+            # command-line length limit, and lazer's DB loads once for both
+            # queries. Lines are chunked because the REPL's line parser is
+            # quadratic in line length. Older CLIs have no `interactive` verb
+            # and exit non-zero, which drops us to the legacy file-based calls.
+            def _run_interactive() -> None:
+                try:
+                    probe_osdb.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                loc = f'-l "{probe_realm_dir}"'
+                lines = []
+                for flag, values in (("-h", hashes), ("-i", beatmap_ids)):
+                    for i in range(0, len(values), 400):
+                        chunk = ",".join(str(v) for v in values[i:i + 400])
+                        lines.append(f"create {flag} {chunk} {loc}")
+                lines += [f'save -o "{probe_osdb}"', "exit"]
+                self._run([*self.cfg.command, "interactive"],
+                          input_text="\n".join(lines) + "\n")
+                _collect()
+
+            try:
+                _run_interactive()
+            except RuntimeError:
+                resolved.clear()
+                resolved_hashes.clear()
+                if hashes:
+                    _run_query("-h", hashes)
+                if beatmap_ids:
+                    _run_query("-b", beatmap_ids)
             return ProbeResult(resolved=resolved, resolved_hashes=resolved_hashes)
         except Exception:
             return ProbeResult()
@@ -1261,7 +1292,7 @@ class CmCliRunner:
         else Path(os.environ.get("TEMP", ".")) / "oc-cm-cli-debug.log"
 
     @classmethod
-    def _run(cls, argv: list[str]) -> None:
+    def _run(cls, argv: list[str], input_text: str | None = None) -> None:
         # Always dump the full invocation + output to a debug log so we
         # can actually see what CM CLI did, even when the GUI's error
         # dialog truncates a multi-thousand-line wine register dump.
@@ -1279,9 +1310,11 @@ class CmCliRunner:
                 run_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
             proc = subprocess.run(
                 argv, capture_output=True, text=True, timeout=600,
+                errors="replace",
                 # Use a proper /dev/null for stdin so .NET doesn't
                 # block trying to read from a tty it doesn't have.
-                stdin=subprocess.DEVNULL,
+                **({"input": input_text} if input_text is not None
+                   else {"stdin": subprocess.DEVNULL}),
                 **run_kwargs,
             )
             dlog.write(f"exit: {proc.returncode}\n")

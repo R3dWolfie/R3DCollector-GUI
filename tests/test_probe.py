@@ -18,6 +18,12 @@ def _write_fake_probe_osdb(dest: Path, resolved_beatmaps: list[BeatmapInfo]) -> 
     OsdbWriter.write(dest, info)
 
 
+def _no_interactive() -> MagicMock:
+    """What a pre-1.3.0 CM CLI does with the unknown `interactive` verb."""
+    r = MagicMock(); r.returncode = 1; r.stdout = ""; r.stderr = ""
+    return r
+
+
 def test_probe_writes_bids_to_realm_parent_and_returns_resolved(tmp_path):
     realm = tmp_path / "client.realm"
     realm.write_bytes(b"fake")
@@ -26,6 +32,8 @@ def test_probe_writes_bids_to_realm_parent_and_returns_resolved(tmp_path):
     captured_argv: list[list[str]] = []
 
     def fake_run(argv, **kwargs):
+        if argv[-1] == "interactive":
+            return _no_interactive()
         captured_argv.append(argv)
         # Find the `-o` argument and write a fake probe.osdb there.
         out_idx = argv.index("-o") + 1
@@ -84,6 +92,8 @@ def test_probe_matches_by_hash_including_onlineid_minus_one(tmp_path):
     captured: list[list[str]] = []
 
     def fake_run(argv, **kwargs):
+        if argv[-1] == "interactive":
+            return _no_interactive()
         captured.append(argv)
         out_path = Path(argv[argv.index("-o") + 1])
         _write_fake_probe_osdb(out_path, [
@@ -109,6 +119,40 @@ def test_probe_matches_by_hash_including_onlineid_minus_one(tmp_path):
     assert "hash-ranked" in result.resolved_hashes
     assert "hash-unverified" in result.resolved_hashes   # the OnlineID=-1 case
     assert "hash-missing" not in result.resolved_hashes  # Unknown -> not imported
+
+
+def test_probe_uses_interactive_stdin_on_cm_cli_1_3(tmp_path):
+    """CM CLI 1.3.0+ dropped -b and file-path values, so ids and hashes go
+    through the `interactive` REPL on stdin in a single invocation."""
+    realm = tmp_path / "client.realm"
+    realm.write_bytes(b"fake")
+    tmp_dir = realm.parent / ".oc-gui-tmp"
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs.get("input", "")))
+        _write_fake_probe_osdb(tmp_dir / "probe.osdb", [
+            BeatmapInfo(beatmap_id=42, set_id=100, md5="hash-ranked",
+                        artist="A", title="T", diff_name="D"),
+        ])
+        r = MagicMock(); r.returncode = 0; r.stdout = ""; r.stderr = ""
+        return r
+
+    runner = CmCliRunner(CmCliConfig(command=["/fake/cm.exe"], osu_location=None))
+    with patch("osu_collector_gui.subprocess.run", side_effect=fake_run):
+        result = runner.probe_imported_beatmaps(
+            realm, [42, 99], hashes=["hash-ranked", "hash-missing"])
+
+    [(argv, script)] = calls                  # one launch, no legacy fallback
+    assert argv == ["/fake/cm.exe", "interactive"]
+    lines = script.splitlines()
+    assert lines[0].startswith("create -h hash-ranked,hash-missing -l ")
+    assert lines[1].startswith("create -i 42,99 -l ")
+    assert f'"{tmp_dir / "probe-realm"}"' in lines[0]
+    assert lines[2] == f'save -o "{tmp_dir / "probe.osdb"}"'
+    assert lines[3] == "exit"
+    assert 42 in result.resolved
+    assert "hash-ranked" in result.resolved_hashes
 
 
 def test_probe_returns_empty_result_when_cm_cli_fails(tmp_path):
