@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.17"
+APP_VERSION = "1.5.18"
 APP_AUTHOR = "Red"
 
 
@@ -1558,6 +1558,7 @@ class CmCliInstaller:
                      f"--filesystem={CM_CLI_CACHE_DIR}",
                      "org.winehq.Wine"],
                     check=False, capture_output=True, timeout=10,
+                    env=_child_env(),
                 )
                 log_func(f"Granted wine flatpak access to {CM_CLI_CACHE_DIR}")
             except (OSError, subprocess.SubprocessError):
@@ -1594,7 +1595,7 @@ class CmCliInstaller:
         def run(cmd, timeout=None, check=True):
             log_func("$ " + " ".join(str(c) for c in cmd))
             p = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout)
+                               timeout=timeout, env=_child_env())
             if check and p.returncode != 0:
                 raise RuntimeError(
                     f"'{' '.join(cmd[:3])} …' failed ({p.returncode}): "
@@ -1602,7 +1603,8 @@ class CmCliInstaller:
             return p
 
         remotes = subprocess.run(["flatpak", "remotes"],
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True,
+                                 env=_child_env())
         if "flathub" not in (remotes.stdout or ""):
             run(["flatpak", "remote-add", "--if-not-exists", "--user",
                  "flathub", "https://flathub.org/repo/flathub.flatpakrepo"])
@@ -1611,7 +1613,8 @@ class CmCliInstaller:
         branch = "stable-25.08"
         ls = subprocess.run(
             ["flatpak", "remote-ls", "flathub",
-             "--columns=application,branch"], capture_output=True, text=True)
+             "--columns=application,branch"], capture_output=True, text=True,
+            env=_child_env())
         stables = sorted(
             parts[1] for parts in (ln.split() for ln in (ls.stdout or "").splitlines())
             if len(parts) >= 2 and parts[0] == app_id and parts[1].startswith("stable-"))
@@ -2949,9 +2952,9 @@ def _open_in_file_manager(path: Path) -> None:
         if sys.platform == "win32":
             os.startfile(str(path))  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
+            subprocess.Popen(["open", str(path)], env=_child_env())
         else:
-            subprocess.Popen(["xdg-open", str(path)])
+            subprocess.Popen(["xdg-open", str(path)], env=_child_env())
     except Exception:
         pass
 
@@ -2995,7 +2998,7 @@ def _launch_updater(path: Path) -> None:
     if sys.platform == "win32":
         os.startfile(str(path))  # type: ignore[attr-defined]  # runs Setup.exe
     elif sys.platform == "darwin":
-        subprocess.Popen(["open", str(path)])  # mounts the .dmg
+        subprocess.Popen(["open", str(path)], env=_child_env())  # mounts the .dmg
     elif str(path).endswith((".tar.gz", ".tgz")):
         # Portable tarball: extract beside the current install, swap it in,
         # relaunch, and exit (see below). Does not return on success.
@@ -3005,7 +3008,8 @@ def _launch_updater(path: Path) -> None:
             os.chmod(path, 0o755)
         except OSError:
             pass
-        subprocess.Popen([str(path)], start_new_session=True)  # AppImage
+        subprocess.Popen([str(path)], start_new_session=True,
+                         env=_child_env())  # AppImage
 
 
 def _apply_linux_tarball_update(tar_path: Path) -> None:
@@ -3700,8 +3704,16 @@ class JsApi:
 
     def _open_releases_page(self, message: str = "") -> dict:
         try:
-            import webbrowser
-            webbrowser.open(GITHUB_RELEASES_PAGE)
+            if sys.platform.startswith("linux"):
+                # webbrowser.open would hand xdg-open (and the browser) our
+                # bundled LD_LIBRARY_PATH; launch it with a clean env.
+                subprocess.Popen(["xdg-open", GITHUB_RELEASES_PAGE],
+                                 env=_child_env(), start_new_session=True,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            else:
+                import webbrowser
+                webbrowser.open(GITHUB_RELEASES_PAGE)
         except Exception:
             pass
         out = {"ok": True, "opened": "page"}
@@ -3923,6 +3935,11 @@ def main() -> int:
             # tarball, so the sandbox can't start. We only ever load our own
             # local, trusted frontend, so disabling it is safe.
             os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+            # The bundled libgbm was built on Ubuntu and looks for its GPU
+            # driver at Ubuntu's path, so on other distros (Arch) every frame
+            # fails ("Compositor returned null texture") and the window stays
+            # blank. Our UI is plain HTML; software rendering is plenty.
+            os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
         try:
             import qtpy  # noqa: F401 — probe for the Qt backend
             gui = "qt"

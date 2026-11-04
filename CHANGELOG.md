@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.18] — 2026-11-04
+
+### Fixed
+
+- **Linux download: "Install Collection Manager" failed on Arch** with
+  `flatpak: …/_internal/libcrypto.so.3: version 'OPENSSL_3.4.0' not found`.
+  The packaged build leaked its own (older, Ubuntu-built) library path into
+  the programs it launches, so the system's flatpak loaded the app's
+  OpenSSL instead of its own. Every external launch (flatpak, xdg-open,
+  installers, the browser) now gets a clean environment, and a test keeps it
+  that way.
+- **Linux download: blank window on non-Ubuntu distros** ("Compositor
+  returned null texture" spam). The bundled graphics library looks for its
+  GPU driver at Ubuntu's path; the packaged build now renders in software by
+  default (override with `QTWEBENGINE_CHROMIUM_FLAGS`).
+
 ## [1.5.17] — 2026-10-08
 
 ### Fixed
