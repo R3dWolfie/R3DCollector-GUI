@@ -88,7 +88,7 @@
         </div>
 
         <div class="card">
-          <label class="field-label" for="target">Import into osu!lazer collection</label>
+          <label class="field-label" for="target">Import into <span class="cn">osu!lazer</span> collection</label>
           <select id="target" class="select"></select>
           <div id="new-name-wrap" class="hidden" style="margin-top:12px;">
             <label class="field-label" for="new-name">New collection name</label>
@@ -122,10 +122,32 @@
         </div>
 
         <div class="card">
+          <span class="kicker" style="display:block;margin-bottom:10px;">// osu! client</span>
+          <div class="client-picker" id="client-picker">
+            <button class="tune-preset" data-client="lazer" type="button">
+              <span class="tp-name">osu!lazer</span>
+              <span class="tp-sub">imports via the game · collections via Collection Manager</span>
+            </button>
+            <button class="tune-preset" data-client="stable" type="button">
+              <span class="tp-name">osu! stable</span>
+              <span class="tp-sub">maps into Songs · collections into collection.db</span>
+            </button>
+          </div>
+          <div class="stable-only" style="margin-top:14px;">
+            <label class="field-label" for="stable_dir">osu! stable folder (the one with osu!.exe)</label>
+            <div class="input-row">
+              <input id="stable_dir" class="text-input mono" placeholder="(auto-detected)" />
+              <button class="btn" id="browse-stable">Browse…</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
           <span class="kicker" style="display:block;margin-bottom:14px;">// detected</span>
-          <div class="detect-line" id="d-osu"><span class="pill">osu!lazer</span><span class="path">—</span></div>
-          <div class="detect-line" id="d-realm"><span class="pill">client.realm</span><span class="path">—</span></div>
-          <div class="detect-line" id="d-cm"><span class="pill">collection mgr</span><span class="path">—</span></div>
+          <div class="detect-line stable-only" id="d-stable"><span class="pill">osu! stable</span><span class="path">—</span></div>
+          <div class="detect-line lazer-only" id="d-osu"><span class="pill">osu!lazer</span><span class="path">—</span></div>
+          <div class="detect-line lazer-only" id="d-realm"><span class="pill">client.realm</span><span class="path">—</span></div>
+          <div class="detect-line lazer-only" id="d-cm"><span class="pill">collection mgr</span><span class="path">—</span></div>
         </div>
 
         <div class="card">
@@ -140,8 +162,9 @@
           <div class="card">
             <span class="kicker" style="display:block;margin-bottom:6px;">// behaviour</span>
             <div class="toggle-row">
-              <div class="meta"><div class="t">Auto-import into osu!lazer</div>
-                <div class="d">Send each map to lazer the moment it downloads.</div></div>
+              <div class="meta"><div class="t">Auto-import into <span class="cn">osu!lazer</span></div>
+                <div class="d lazer-only">Send each map to lazer the moment it downloads.</div>
+                <div class="d stable-only">Move each map into your Songs folder as it downloads.</div></div>
               <label class="switch"><input type="checkbox" id="auto_import" />
                 <span class="track"></span><span class="thumb"></span></label>
             </div>
@@ -154,11 +177,11 @@
             </div>
             <div class="toggle-row">
               <div class="meta"><div class="t">Skip already-imported maps</div>
-                <div class="d">Probe lazer and don't re-download what you have.</div></div>
+                <div class="d">Check your <span class="cn">osu!lazer</span> library and don't re-download what you have.</div></div>
               <label class="switch"><input type="checkbox" id="skip_already_imported" />
                 <span class="track"></span><span class="thumb"></span></label>
             </div>
-            <div class="toggle-row">
+            <div class="toggle-row lazer-only">
               <div class="meta"><div class="t">Restart osu!lazer after merging</div>
                 <div class="d">Relaunch the game once collections are written back.</div></div>
               <label class="switch"><input type="checkbox" id="restart_lazer_after" />
@@ -224,6 +247,7 @@
 
         <div class="card">
           <span class="kicker" style="display:block;margin-bottom:12px;">// paths</span>
+          <div class="lazer-only">
           <label class="field-label" for="osu_binary">osu!lazer binary</label>
           <div class="input-row" style="margin-bottom:14px;">
             <input id="osu_binary" class="text-input mono" placeholder="(auto-detected)" />
@@ -239,6 +263,7 @@
           <div class="input-row" style="margin-top:10px;align-items:center;">
             <button class="btn" id="install-cm" type="button">Install Collection Manager</button>
             <span class="dim mono" id="cm-install-status" style="font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+          </div>
           </div>
           <label class="field-label" for="custom_mirrors" style="margin-top:14px;">Extra mirrors (one URL template per line, {id})</label>
           <textarea id="custom_mirrors" class="hero-input" style="min-height:64px;font-size:12.5px;"
@@ -261,7 +286,7 @@
         <div class="view-head">
           <span class="kicker">// export</span>
           <h2>Export a collection</h2>
-          <p>Save an osu!lazer collection to a <code>.db</code> (osu! stable /
+          <p>Save an <span class="cn">osu!lazer</span> collection to a <code>.db</code> (osu! stable /
              osu!collector) or an <code>.osdb</code> (Collection Manager) file.</p>
         </div>
 

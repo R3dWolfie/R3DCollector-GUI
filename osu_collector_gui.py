@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 APP_NAME = "osu-collector-gui"
-APP_VERSION = "1.5.18"
+APP_VERSION = "1.6.0"
 APP_AUTHOR = "Red"
 
 
@@ -1884,6 +1884,266 @@ class OsuLazerImporter:
 
 
 # ---------------------------------------------------------------------------
+# osu! stable (the classic client)
+# ---------------------------------------------------------------------------
+
+class StableCollectionDb:
+    """Read/write osu! stable's collection.db natively (no Collection Manager).
+
+    Layout: int32 version, int32 count, then per collection an osu!-string
+    name, int32 n and n osu!-string beatmap MD5s. An osu!-string is 0x00
+    (null) or 0x0b + ULEB128 length + UTF-8 bytes.
+    """
+    VERSION = 20250107
+
+    @staticmethod
+    def _read_string(buf: io.BytesIO) -> str:
+        flag = buf.read(1)
+        if flag == b"\x00":
+            return ""
+        if flag != b"\x0b":
+            raise ValueError("collection.db: bad string marker")
+        n = shift = 0
+        while True:
+            (byte,) = buf.read(1)
+            n |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                break
+            shift += 7
+        data = buf.read(n)
+        if len(data) != n:
+            raise ValueError("collection.db: truncated")
+        return data.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _write_string(out: io.BytesIO, s: str) -> None:
+        data = s.encode("utf-8")
+        out.write(b"\x0b")
+        n = len(data)
+        while n >= 0x80:
+            out.write(bytes([(n & 0x7F) | 0x80]))
+            n >>= 7
+        out.write(bytes([n]))
+        out.write(data)
+
+    @classmethod
+    def read(cls, path: Path) -> tuple[int, list[tuple[str, list[str]]]]:
+        """Return (version, [(name, [md5, ...]), ...]). A missing file is an
+        empty database."""
+        try:
+            raw = Path(path).read_bytes()
+        except FileNotFoundError:
+            return cls.VERSION, []
+        buf = io.BytesIO(raw)
+        version, count = struct.unpack("<ii", buf.read(8))
+        cols = []
+        for _ in range(count):
+            name = cls._read_string(buf)
+            (n,) = struct.unpack("<i", buf.read(4))
+            cols.append((name, [cls._read_string(buf) for _ in range(n)]))
+        return version, cols
+
+    @classmethod
+    def write(cls, path: Path, cols: list[tuple[str, list[str]]],
+              version: int | None = None) -> None:
+        """Write atomically (temp file + rename) so a crash mid-write can't
+        leave stable with a truncated collection.db."""
+        out = io.BytesIO()
+        out.write(struct.pack("<ii", version or cls.VERSION, len(cols)))
+        for name, hashes in cols:
+            cls._write_string(out, name)
+            out.write(struct.pack("<i", len(hashes)))
+            for h in hashes:
+                cls._write_string(out, h)
+        path = Path(path)
+        tmp = path.with_name(path.name + ".oc-tmp")
+        tmp.write_bytes(out.getvalue())
+        os.replace(tmp, path)
+
+    @staticmethod
+    def merge(existing: list[tuple[str, list[str]]],
+              incoming: list[tuple[str, list[str]]]
+              ) -> tuple[list[tuple[str, list[str]]], int]:
+        """Union `incoming` into `existing` by collection name (new names are
+        appended, order kept, no duplicate hashes). Returns (merged, added)."""
+        merged = [(n, list(h)) for n, h in existing]
+        index = {n: i for i, (n, _) in enumerate(merged)}
+        added = 0
+        for name, hashes in incoming:
+            if name not in index:
+                index[name] = len(merged)
+                merged.append((name, []))
+            cur = merged[index[name]][1]
+            seen = set(cur)
+            for h in hashes:
+                if h and h not in seen:
+                    seen.add(h)
+                    cur.append(h)
+                    added += 1
+        return merged, added
+
+
+class OsuStable:
+    """An osu! stable install: where it lives, its Songs folder and
+    collection.db, whether it's running, and handing it new maps."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+
+    # ---- discovery -------------------------------------------------------
+
+    @staticmethod
+    def _is_install(d: Path) -> bool:
+        try:
+            return (d / "osu!.exe").is_file()
+        except OSError:
+            return False
+
+    @classmethod
+    def candidates(cls) -> list[Path]:
+        home = Path.home()
+        user = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+        out: list[Path] = []
+        if sys.platform == "win32":
+            local = Path(os.environ.get("LOCALAPPDATA") or home / "AppData/Local")
+            out += [local / "osu!", Path("C:/osu!"), Path("C:/Program Files/osu!"),
+                    Path("C:/Program Files (x86)/osu!"), Path("D:/osu!")]
+        elif sys.platform == "darwin":
+            out += [Path("/Applications/osu!.app/Contents/Resources/drive_c/osu!"),
+                    home / "Applications/osu!.app/Contents/Resources/drive_c/osu!"]
+        else:
+            # osu-winello, plain wine, the WineHQ flatpak, Lutris, Bottles.
+            out += [home / ".local/share/osu-wine/osu!",
+                    home / ".local/share/osu-wine/OSU",
+                    home / ".local/share/osu-stable"]
+            prefixes = [home / ".wine",
+                        home / ".local/share/wineprefixes/osu",
+                        home / ".local/share/osu-wine/WINE.osu",
+                        home / ".var/app/org.winehq.Wine/data/wine"]
+            for games in (home / "Games", home / ".var/app/com.usebottles.bottles"
+                          / "data/bottles/bottles"):
+                try:
+                    prefixes += sorted(p for p in games.iterdir()
+                                       if "osu" in p.name.lower())
+                except OSError:
+                    pass
+            for pfx in prefixes:
+                drive = pfx / "drive_c" if (pfx / "drive_c").is_dir() else pfx
+                out += [drive / "osu!", drive / "Program Files/osu!",
+                        drive / f"users/{user}/AppData/Local/osu!",
+                        drive / f"users/{user}/Local Settings/Application Data/osu!"]
+        return out
+
+    @classmethod
+    def locate(cls, override: str | None = None) -> "OsuStable | None":
+        """Use the configured folder (or the osu!.exe in it) if valid, else
+        search the usual places."""
+        if override:
+            p = Path(override).expanduser()
+            if p.name.lower() == "osu!.exe":
+                p = p.parent
+            return cls(p) if cls._is_install(p) else None
+        for d in cls.candidates():
+            if cls._is_install(d):
+                return cls(d)
+        return None
+
+    # ---- layout ----------------------------------------------------------
+
+    @property
+    def collection_db(self) -> Path:
+        return self.root / "collection.db"
+
+    @property
+    def songs_dir(self) -> Path:
+        """Songs folder, honouring BeatmapDirectory from osu!.<user>.cfg (a
+        relative path, or an absolute one that exists on this filesystem)."""
+        try:
+            for cfg in sorted(self.root.glob("osu!.*.cfg")):
+                for line in cfg.read_text(errors="replace").splitlines():
+                    key, sep, val = line.partition("=")
+                    if sep and key.strip() == "BeatmapDirectory" and val.strip():
+                        val = val.strip()
+                        cand = Path(val)
+                        if not cand.is_absolute() and not re.match(r"^[A-Za-z]:", val):
+                            cand = self.root / val.replace("\\", "/")
+                        if cand.is_dir():
+                            return cand
+        except OSError:
+            pass
+        return self.root / "Songs"
+
+    # ---- state -----------------------------------------------------------
+
+    def is_running(self) -> bool:
+        """osu!.exe running from this install (natively or under wine) —
+        distinguished from osu!lazer, whose Windows exe has the same name."""
+        try:
+            import psutil
+        except ImportError:
+            return False
+        for p in psutil.process_iter(attrs=["name", "cmdline", "exe"]):
+            try:
+                argv = p.info.get("cmdline") or []
+                # The program itself, not any argument that mentions it (a
+                # shell or editor with "osu!.exe" in its command line).
+                prog = argv[0] if argv else (p.info.get("exe") or "")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            # wine rewrites argv[0] to the Windows path of the .exe.
+            base = re.split(r"[\\/]", prog)[-1].lower()
+            if base == "osu!.exe" and "osulazer" not in prog.lower():
+                return True
+        return False
+
+    def installed_set_ids(self) -> set[int]:
+        """Beatmap set ids already in Songs (folders "123 Artist - Title" or
+        not-yet-imported "123 ….osz"). One directory listing, no recursion."""
+        ids: set[int] = set()
+        try:
+            with os.scandir(self.songs_dir) as it:
+                for e in it:
+                    m = re.match(r"(\d+)[ .]", e.name)
+                    if m:
+                        ids.add(int(m.group(1)))
+        except OSError:
+            pass
+        return ids
+
+    # ---- actions ---------------------------------------------------------
+
+    def import_file(self, osz: Path) -> bool:
+        """Move a downloaded .osz into Songs; stable imports it on its next
+        start or when you press F5 at song select."""
+        songs = self.songs_dir
+        try:
+            songs.mkdir(parents=True, exist_ok=True)
+            dest = songs / osz.name
+            if dest.exists() and dest.stat().st_size > 0:
+                osz.unlink(missing_ok=True)
+                return True
+            shutil.move(str(osz), str(dest))
+            return True
+        except OSError:
+            return False
+
+    def merge_collections(self, incoming: list[tuple[str, list[str]]]) -> tuple[int, Path | None]:
+        """Merge into collection.db, keeping a timestamped backup of the
+        original. Returns (hashes added, backup path)."""
+        db = self.collection_db
+        version, existing = StableCollectionDb.read(db)
+        merged, added = StableCollectionDb.merge(existing, incoming)
+        if not added and len(merged) == len(existing):
+            return 0, None
+        backup = None
+        if db.exists():
+            backup = db.with_name(f"collection.db.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+            shutil.copy2(db, backup)
+        StableCollectionDb.write(db, merged, version)
+        return added, backup
+
+
+# ---------------------------------------------------------------------------
 # Download worker (background thread)
 # ---------------------------------------------------------------------------
 
@@ -1913,6 +2173,11 @@ class DownloadJob:
     # Tuning
     download_parallel: int = DOWNLOAD_PARALLEL  # worker threads; per-mirror
                                                 # adaptive caps govern the rest
+    # Which osu! the run feeds: "lazer" (default) or "stable" (the classic
+    # client — maps go into its Songs folder, collections into collection.db).
+    client: str = "lazer"
+    stable_dir: str | None = None             # override; None = auto-detect
+    add_to_stable_collections: bool = False
 
 
 class Downloader:
@@ -1961,6 +2226,10 @@ class Downloader:
         # _maybe_import path checks job.auto_import before actually
         # invoking it, so this is purely about knowing the binary.
         self.importer = OsuLazerImporter(binary_override=job.osu_binary)
+        self.stable: OsuStable | None = (
+            OsuStable.locate(job.stable_dir) if job.client == "stable" else None)
+        self._stable_installed: set[int] | None = None   # lazy Songs scan
+        self._stable_collections: list[tuple[str, list[str]]] = []
         import queue as _q
         import threading as _t
         # Each map is imported into osu!lazer as it finishes downloading, by a
@@ -1999,6 +2268,9 @@ class Downloader:
         already have in osu!lazer is useful for any download (incl. a plain one
         or a re-run), so it only needs the toggle + a readable realm + CM CLI.
         """
+        if self.job.client == "stable":
+            # Stable: a listing of the Songs folder is enough, no CLI needed.
+            return bool(self.job.skip_already_imported and self.stable)
         return bool(
             self.job.skip_already_imported
             and self.job.cm_cli_command
@@ -2019,7 +2291,8 @@ class Downloader:
         return bool(
             self.job.generate_osdb
             or self.job.add_to_lazer_collections
-            or self._probe_enabled_for_job()
+            or self.job.add_to_stable_collections
+            or (self._probe_enabled_for_job() and self.job.client != "stable")
         )
 
     def confirm_merge_continue(self) -> None:
@@ -2033,7 +2306,9 @@ class Downloader:
     def _maybe_import(self, path: Path) -> None:
         """Queue a downloaded map; the worker imports it into osu!lazer as
         soon as it's free (one at a time)."""
-        if not self.job.auto_import or not self.importer.binary:
+        if not self.job.auto_import:
+            return
+        if not (self.stable if self.job.client == "stable" else self.importer.binary):
             return
         self._ensure_import_worker()
         self._import_queue.put(path)
@@ -2051,7 +2326,9 @@ class Downloader:
                 if self._cancelled:
                     continue              # drain without importing
                 try:
-                    if self.importer.import_streamed(path):
+                    ok = (self.stable.import_file(path) if self.stable
+                          else self.importer.import_streamed(path))
+                    if ok:
                         self._import_calls_issued += 1
                     else:
                         self._import_failed += 1
@@ -2099,7 +2376,14 @@ class Downloader:
         # Make a missing lazer binary LOUD. Without this the auto-import
         # path no-ops silently — maps download fine but never reach the
         # game, with no clue why.
-        if self.job.auto_import and not self.importer.binary:
+        if self.job.client == "stable" and not self.stable:
+            self._log(
+                "[stable] WARNING: osu! stable wasn't found, so maps stay in "
+                "the output folder and collections aren't written. Set the "
+                "osu! stable folder in Settings → Paths."
+            )
+        elif (self.job.client != "stable" and self.job.auto_import
+                and not self.importer.binary):
             self._log(
                 "[lazer] WARNING: auto-import is ON but no osu!lazer "
                 "executable was found. Downloaded maps will NOT be imported "
@@ -2148,7 +2432,7 @@ class Downloader:
             # silently reporting "0 skipped": it needs the Collection Manager
             # CLI to read osu!lazer's library (Settings → Install Collection
             # Manager; on Linux that's the one-time wine setup).
-            if (self.job.skip_already_imported
+            if (self.job.skip_already_imported and self.job.client != "stable"
                     and not self._probe_enabled_for_job()):
                 self._log(
                     "  [skip] 'skip already-imported' is on but Collection "
@@ -2170,7 +2454,16 @@ class Downloader:
             # --- probe lazer for which sets it already has ---
             skipped_set_ids: set[int] = set()
             probe_md5_map: dict[int, str] = {}
-            if self._probe_enabled_for_job() and info.beatmaps and not self._cancelled:
+            if (self.job.client == "stable" and self._probe_enabled_for_job()
+                    and not self._cancelled):
+                if self._stable_installed is None:
+                    self._stable_installed = self.stable.installed_set_ids()
+                skipped_set_ids = set(info.beatmapset_ids) & self._stable_installed
+                self._log(
+                    f"  [probe] osu! stable already has {len(skipped_set_ids)}/"
+                    f"{len(info.beatmapset_ids)} sets in Songs"
+                )
+            elif self._probe_enabled_for_job() and info.beatmaps and not self._cancelled:
                 try:
                     self._prep(
                         f"Checking your osu!lazer library "
@@ -2205,6 +2498,12 @@ class Downloader:
                     # Fail-open: probe failures cost bandwidth, not data.
                     self._log(f"  [probe] failed: {e} — proceeding without dedup")
 
+            if self.job.add_to_stable_collections:
+                hashes = [b.md5 for b in info.beatmaps if b.md5]
+                if hashes:
+                    self._stable_collections.append(
+                        (self.job.target_collection_name or info.name, hashes))
+
             ok = 0
             failed = 0
             absent = 0   # 404 on every mirror — genuinely not hosted anywhere
@@ -2233,7 +2532,8 @@ class Downloader:
                     done = len(skipped_set_ids & set(set_ids))
                     skipped = done
                     self._beatmap_progress(done, len(set_ids))
-                    self._log(f"  [skip] {skipped} set(s) already imported in lazer")
+                    self._log(f"  [skip] {skipped} set(s) already in "
+                             f"{'osu! stable' if self.stable else 'osu!lazer'}")
                 ex = ThreadPoolExecutor(max_workers=workers)
                 try:
                     futures = {
@@ -2342,8 +2642,20 @@ class Downloader:
         # osu!lazer before we report "done" / touch the realm.
         self._flush_imports()
 
+        # --- osu! stable: write collection.db natively ---
+        if self.job.client == "stable":
+            if self.job.add_to_stable_collections and not self._cancelled:
+                try:
+                    self._merge_into_stable()
+                except Exception as e:
+                    self._error(f"osu! stable collection merge failed: {e}")
+            if self._import_calls_issued and not self._cancelled:
+                self._log(
+                    f"[stable] {self._import_calls_issued} map(s) moved into "
+                    f"{self.stable.songs_dir}. osu! imports them next time it "
+                    "starts, or press F5 at song select if it's open.")
         # --- merge into lazer collections via CM CLI ---
-        if self.job.add_to_lazer_collections and not self._cancelled:
+        elif self.job.add_to_lazer_collections and not self._cancelled:
             try:
                 self._merge_into_lazer()
             except Exception as e:
@@ -2429,6 +2741,34 @@ class Downloader:
         self._log(
             f"[cleanup] removed {deleted} collection folder(s), kept {kept} other entr(ies)"
         )
+
+    # ---- osu! stable collection merge -------------------------------------
+
+    def _merge_into_stable(self, poll_s: float = 2.0,
+                           max_wait_s: float = 1800.0) -> None:
+        """Merge this run's collections into stable's collection.db. Stable
+        rewrites the file from memory when it exits, so a merge while it's
+        running would be thrown away: wait (cancellable) until it's closed."""
+        if not self.stable or not self._stable_collections:
+            return
+        if self.stable.is_running():
+            self._log("[stable] osu! is running — close it to write the "
+                      "collections (osu! would overwrite them on exit)…")
+            waited = 0.0
+            while self.stable.is_running():
+                if self._cancelled or waited >= max_wait_s:
+                    self._log("[stable] collections NOT written (osu! stayed "
+                              "open). Re-run after closing osu!.")
+                    return
+                self._prep("Close osu! to write your collections…",
+                           title="Waiting for osu! to close…")
+                time.sleep(poll_s)
+                waited += poll_s
+        added, backup = self.stable.merge_collections(self._stable_collections)
+        names = ", ".join(sorted({n for n, _ in self._stable_collections}))
+        self._log(f"[stable] collection.db: added {added} map(s) to {names}")
+        if backup:
+            self._log(f"[stable] backup of the previous file: {backup.name}")
 
     # ---- lazer collection merge ------------------------------------------
 
@@ -3190,6 +3530,9 @@ class JsApi:
                 det[path_key] = str(Path(raw).expanduser())
                 det[detected_key] = True
 
+        stable = OsuStable.locate((s.get("stable_dir") or "").strip() or None)
+        det["stable_dir"] = str(stable.root) if stable else ""
+        det["stable_detected"] = stable is not None
         _override("realm_path", "realm_detected", s.get("lazer_realm_path"))
         _override("osu_binary", "osu_detected", s.get("osu_binary"))
 
@@ -3240,6 +3583,8 @@ class JsApi:
                 "lazer_realm_path": s.get("lazer_realm_path") or auto["realm_path"],
                 "cm_cli_command": cm_str,
                 "custom_mirrors": s.get("custom_mirrors", ""),
+                "client": self._client(),
+                "stable_dir": s.get("stable_dir", ""),
             },
             "detected": self._detected_state(),
             "labels": {
@@ -3248,6 +3593,12 @@ class JsApi:
                 "no_merge": target_combo_no_merge_label(),
             },
         }
+
+    def _client(self) -> str:
+        return "stable" if self._settings.get("client") == "stable" else "lazer"
+
+    def _stable(self) -> "OsuStable | None":
+        return OsuStable.locate((self._settings.get("stable_dir") or "").strip() or None)
 
     def _merge_settings(self, settings: dict) -> None:
         if not settings:
@@ -3272,6 +3623,10 @@ class JsApi:
             S["cm_cli_command"] = _normalize_cm(settings["cm_cli_command"])
         if "custom_mirrors" in settings:
             S["custom_mirrors"] = settings["custom_mirrors"] or ""
+        if "client" in settings:
+            S["client"] = "stable" if settings["client"] == "stable" else "lazer"
+        if "stable_dir" in settings:
+            S["stable_dir"] = (settings["stable_dir"] or "").strip()
         if "theme" in settings:
             S["theme"] = settings["theme"]
 
@@ -3371,7 +3726,18 @@ class JsApi:
 
     def scan_collections(self) -> dict:
         """Auto-scan the osu! folder: export existing lazer collections via CM
-        CLI so the user can pick one to merge into — no button required."""
+        CLI so the user can pick one to merge into — no button required.
+        osu! stable: read its collection.db directly."""
+        if self._client() == "stable":
+            stable = self._stable()
+            if not stable:
+                return {"ok": False, "reason": "no_stable"}
+            try:
+                _v, cols = StableCollectionDb.read(stable.collection_db)
+            except Exception as e:
+                return {"ok": False, "reason": "error", "error": str(e)}
+            return {"ok": True, "client": "stable",
+                    "collections": [{"name": n, "count": len(h)} for n, h in cols]}
         auto = _autodetect_paths()
         realm = (self._settings.get("lazer_realm_path") or auto["realm_path"]).strip()
         cm_value = self._settings.get("cm_cli_command")
@@ -3421,6 +3787,29 @@ class JsApi:
             return res[0] if isinstance(res, (list, tuple)) else str(res)
         return ""
 
+    def _export_stable(self, name: str, dest: Path, fmt: str) -> dict:
+        stable = self._stable()
+        if not stable:
+            return {"ok": False, "error": "osu! stable not found."}
+        try:
+            version, cols = StableCollectionDb.read(stable.collection_db)
+            if name:
+                cols = [c for c in cols if c[0] == name]
+                if not cols:
+                    return {"ok": False, "error": f"Collection {name!r} not found."}
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if fmt == ".db":
+                StableCollectionDb.write(dest, cols, version)
+            else:
+                OsdbWriter.write_many(dest, [
+                    CollectionInfo(id=0, name=n, uploader="osu! stable",
+                                   beatmap_count=len(h),
+                                   beatmaps=[BeatmapInfo(0, 0, md5) for md5 in h])
+                    for n, h in cols], editor="osu! stable")
+            return {"ok": True, "path": str(dest)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def export_to_file(self, payload: dict) -> dict:
         """Export an existing osu!lazer collection (or all of them) to a
         `.db` (osu! stable / collector format) or `.osdb` file.
@@ -3436,6 +3825,9 @@ class JsApi:
             return {"ok": False, "error": "No destination chosen."}
         dest = Path(dest_s).expanduser()
         fmt = ".osdb" if dest.suffix.lower() == ".osdb" else ".db"
+
+        if self._client() == "stable":
+            return self._export_stable(name, dest, fmt)
 
         auto = _autodetect_paths()
         realm_s = (self._settings.get("lazer_realm_path")
@@ -3531,8 +3923,11 @@ class JsApi:
             except OSError:
                 pass
 
-            auto = _autodetect_paths()
             S = self._settings
+            if self._client() == "stable":
+                return self._start_stable(ids, out_dir, target, new_name)
+
+            auto = _autodetect_paths()
             cm_cmd = _normalize_cm(S.get("cm_cli_command")) \
                 or _normalize_cm(auto["cm_cli_command"]) or None
             realm = (S.get("lazer_realm_path") or auto["realm_path"]).strip() or None
@@ -3642,6 +4037,71 @@ class JsApi:
             self._thread.start()
             return {"ok": True, "count": len(ids), "output_dir": str(out_dir),
                     "warning": merge_warning}
+
+    def _extra_mirrors(self) -> list[str]:
+        out: list[str] = []
+        for line in str(self._settings.get("custom_mirrors", "")).splitlines():
+            tmpl = BeatmapMirror.normalize_template(line)
+            if tmpl:
+                out.append(tmpl)
+        return out
+
+    def _start_stable(self, ids: list[int], out_dir: Path, target: str,
+                      new_name: str) -> dict:
+        """start() for osu! stable: no Collection Manager, no wine. Called
+        with self._lock held."""
+        S = self._settings
+        stable = self._stable()
+        no_merge = target_combo_no_merge_label()
+        merge_wanted = target != no_merge
+        target_name: str | None = None
+        if target == NEW_TARGET:
+            if not new_name:
+                return {"ok": False, "error": "Enter a name for the new collection."}
+            target_name = new_name
+        elif target not in (DEFAULT_TARGET, no_merge):
+            target_name = target
+        warning = None
+        if not stable:
+            warning = ("osu! stable wasn't found — maps will download to the "
+                       "output folder only. Set its folder in Settings → Paths.")
+        job = DownloadJob(
+            collection_ids=ids,
+            output_dir=out_dir,
+            download_beatmaps=True,
+            extra_mirrors=self._extra_mirrors(),
+            generate_osdb=bool(S.get("generate_osdb", False)),
+            auto_import=bool(S.get("auto_import", True)),
+            target_collection_name=target_name,
+            cleanup_after_import=bool(S.get("cleanup_after_import", False)),
+            skip_already_imported=bool(S.get("skip_already_imported", True)),
+            download_parallel=int(S.get("download_parallel", DOWNLOAD_PARALLEL)),
+            skip_video=bool(S.get("skip_video", True)),
+            client="stable",
+            stable_dir=str(stable.root) if stable else None,
+            add_to_stable_collections=merge_wanted and stable is not None,
+        )
+        consolidate = bool(S.get("consolidate_osdb", False))
+        self._downloader = Downloader(job, self._emit_event)
+
+        def _run() -> None:
+            try:
+                self._downloader.run()
+            except Exception as e:
+                self._emit_event("error", {"message": str(e)})
+                self._emit_event("batch_finished", {"ok": 0, "total": len(ids)})
+            finally:
+                if consolidate:
+                    try:
+                        _consolidate_osdb(out_dir, self._emit_event)
+                    except Exception:
+                        pass
+
+        self._thread = threading.Thread(target=_run, daemon=True,
+                                        name="oc-download")
+        self._thread.start()
+        return {"ok": True, "count": len(ids), "output_dir": str(out_dir),
+                "warning": warning}
 
     # ----- updates ---------------------------------------------------------
 

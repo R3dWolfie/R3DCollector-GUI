@@ -558,3 +558,8 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 900;
 @media (max-width: 720px) {
   .presets-row { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* osu! client picker + per-client visibility */
+.client-picker { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+body.client-stable .lazer-only,
+body:not(.client-stable) .stable-only { display: none !important; }

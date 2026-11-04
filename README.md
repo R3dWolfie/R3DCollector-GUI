@@ -2,7 +2,7 @@
 
 [![Build Windows .exe](https://github.com/R3dWolfie/R3DCollector-GUI/actions/workflows/build-windows.yml/badge.svg)](https://github.com/R3dWolfie/R3DCollector-GUI/actions/workflows/build-windows.yml)
 
-A cross-platform GUI for downloading [osu!collector](https://osucollector.com/) collections, with live progress and optional auto-import to **osu!lazer**. Built in the **R3D "Cherry"** design system — a warm near-black look with industrial-condensed display type and monospace technical labelling.
+A cross-platform GUI for downloading [osu!collector](https://osucollector.com/) collections, with live progress and optional auto-import to **osu!lazer** or **osu! stable**. Built in the **R3D "Cherry"** design system — a warm near-black look with industrial-condensed display type and monospace technical labelling.
 
 > **Windows users**: pre-built `.exe` is on every [GitHub Actions](https://github.com/R3dWolfie/R3DCollector-GUI/actions) run as a build artifact, and tagged releases get a published binary on the [Releases](https://github.com/R3dWolfie/R3DCollector-GUI/releases) page.
 
@@ -124,6 +124,26 @@ documented there too.
 ## Linux: add to your application menu
 
 Drop the included `osu-collector-gui.desktop` into `~/.local/share/applications/` and update the `Exec=` line to point at your install.
+
+## osu! stable
+
+Switch **Settings → osu! client** to **osu! stable** and the app feeds the
+classic client instead, with nothing extra to install (no Collection Manager,
+no wine setup for the app itself):
+
+- Downloaded maps are moved into your **Songs** folder (honours
+  `BeatmapDirectory` in `osu!.<user>.cfg`). osu! imports them the next time it
+  starts, or press **F5** at song select if it's already open.
+- Collections are merged straight into **collection.db**. osu! rewrites that
+  file when it closes, so the app waits for osu! to be closed before writing,
+  and keeps a timestamped `collection.db.bak-…` of the previous file.
+- **Skip already-imported** checks which beatmap sets are already in Songs.
+- The **Export** tab exports stable's collections to `.db` or `.osdb`.
+
+The install is auto-detected in the usual places (Windows
+`%LOCALAPPDATA%\osu!`; on Linux osu-winello, `~/.wine`, the WineHQ flatpak,
+Lutris/Bottles prefixes). Otherwise point **osu! stable folder** at the folder
+containing `osu!.exe`.
 
 ## Auto-import to osu!lazer
 
