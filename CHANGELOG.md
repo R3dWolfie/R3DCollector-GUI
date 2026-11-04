@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.0] — 2026-11-04
+
+### Added
+
+- **osu! stable support.** Settings → osu! client → osu! stable. Maps go
+  into your Songs folder, collections are merged natively into
+  collection.db (waits for osu! to close, keeps a backup), skip-already-
+  imported reads the Songs folder, and Export works on stable's collections.
+  No Collection Manager CLI or wine setup needed. The install is
+  auto-detected (Windows, osu-winello, wine/flatpak/Lutris/Bottles
+  prefixes) or set by hand.
+
 ## [1.5.18] — 2026-11-04
 
 ### Fixed

@@ -10,7 +10,8 @@ const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 const state = {
   labels: { default_target: "", new_target: "", no_merge: "Don't merge" },
-  collections: [],   // scanned lazer collections
+  collections: [],   // scanned collections of the selected client
+  client: "lazer",   // "lazer" | "stable"
   running: false,
   totalCollections: 0,
   lastFile: "",
@@ -109,6 +110,8 @@ function applyState(st) {
   setVal("lazer_realm_path", s.lazer_realm_path);
   setVal("cm_cli_command", s.cm_cli_command);
   setVal("custom_mirrors", s.custom_mirrors);
+  setVal("stable_dir", s.stable_dir);
+  setClient(s.client || "lazer");
 
   renderDetected(st.detected || {});
   buildTargetOptions(st.target);
@@ -129,6 +132,11 @@ function renderDetected(d) {
   row("#d-osu", d.osu_detected, d.osu_binary);
   row("#d-realm", d.realm_detected, d.realm_path);
   row("#d-cm", d.cm_detected, d.cm_cli_command);
+  row("#d-stable", d.stable_detected, d.stable_dir);
+  if (state.client === "stable") {
+    $("#foot-detect").textContent = d.stable_detected ? "osu! stable found" : "osu! stable not found";
+    return;
+  }
   const n = [d.osu_detected, d.realm_detected, d.cm_detected].filter(Boolean).length;
   $("#foot-detect").textContent = n + "/3 detected";
 }
@@ -154,6 +162,26 @@ function buildTargetOptions(selected) {
   onTargetChange();
 }
 
+function clientName() { return state.client === "stable" ? "osu! stable" : "osu!lazer"; }
+
+function setClient(c) {
+  state.client = c === "stable" ? "stable" : "lazer";
+  document.body.classList.toggle("client-stable", state.client === "stable");
+  $$(".cn").forEach((el) => (el.textContent = clientName()));
+  $$("#client-picker .tune-preset").forEach((b) =>
+    b.classList.toggle("active", b.dataset.client === state.client));
+}
+
+async function switchClient(c) {
+  if (c === state.client) return;
+  setClient(c);
+  state.collections = [];          // the other client's list is stale now
+  buildTargetOptions();
+  buildExportTargets();
+  await saveSettings();
+  scanCollections();
+}
+
 async function scanCollections() {
   let res;
   try { res = await api.scan_collections(); } catch (e) { return; }
@@ -161,7 +189,7 @@ async function scanCollections() {
     state.collections = res.collections;
     buildTargetOptions($("#target").value);
     buildExportTargets();
-    toast("Found " + res.collections.length + " osu!lazer collection(s)", "ok",
+    toast("Found " + res.collections.length + " " + clientName() + " collection(s)", "ok",
           "// scan complete");
   }
 }
@@ -222,6 +250,8 @@ function collectSettings() {
     lazer_realm_path: $("#lazer_realm_path").value,
     cm_cli_command: $("#cm_cli_command").value,
     custom_mirrors: $("#custom_mirrors").value,
+    client: state.client,
+    stable_dir: $("#stable_dir").value,
   };
 }
 
@@ -577,6 +607,12 @@ function wireStaticUi() {
   $("#browse-osu").onclick = async () => {
     const p = await callApi("choose_file", $("#osu_binary").value);
     if (p) { $("#osu_binary").value = p; await saveSettings(); }
+  };
+  $$("#client-picker .tune-preset").forEach((b) =>
+    (b.onclick = () => switchClient(b.dataset.client)));
+  $("#browse-stable").onclick = async () => {
+    const p = await callApi("choose_folder", $("#stable_dir").value);
+    if (p) { $("#stable_dir").value = p; await saveSettings(); scanCollections(); }
   };
   $("#browse-realm").onclick = async () => {
     const p = await callApi("choose_file", $("#lazer_realm_path").value);
